@@ -193,6 +193,13 @@ feature-match, and full-condition PatchGAN at their V1 values. It is separate
 from the ablation control entry point, whose default `sar_class_weight=12`
 must remain unchanged for future paired experiments.
 
+The completed epoch-100 run has no NaN/OOM. Its independent generated-to-real
+probe reports identity `98.59%`, depression `85.16%`, azimuth MAE `23.07`
+degrees, and frozen feature cosine `0.532`. The preview and metric figure are
+published with the corresponding history and transfer JSON; this is an audit
+of the recommended run, not a claim that the native classifier is an
+independent quality oracle.
+
 The paired artifacts are kept under `runs/v1_ablation/`:
 `S2_ssim_1_to_0_three_seed_report.json`,
 `S3_edge_05_to_0_three_seed_report.json`,
