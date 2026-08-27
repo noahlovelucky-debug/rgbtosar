@@ -369,6 +369,53 @@ def multiscale_structure_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.T
     return total / 1.75 + 0.5 * F.l1_loss(fake_gradient, real_gradient) + _ssim_loss(fake, real)
 
 
+def aligned_structure_terms(fake: torch.Tensor, real: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Expose the original V1 structure terms for one-variable ablations.
+
+    The real target is weakly paired, so the small translation selection is
+    retained.  Keeping the individual terms separate lets an experiment remove
+    only 64px L1, SSIM, or edge placement without silently changing the others.
+    """
+    aligned_real = _align_translation(fake, real)
+    pixel_64 = F.l1_loss(fake, aligned_real)
+    pixel_32 = F.l1_loss(F.avg_pool2d(fake, 2), F.avg_pool2d(aligned_real, 2))
+    pixel_16 = F.l1_loss(F.avg_pool2d(fake, 4), F.avg_pool2d(aligned_real, 4))
+    fx, fy = _sobel(fake)
+    rx, ry = _sobel(aligned_real)
+    fake_gradient = torch.sqrt(fx.square() + fy.square() + 1e-6)
+    real_gradient = torch.sqrt(rx.square() + ry.square() + 1e-6)
+    return {
+        "pixel_64": pixel_64,
+        "pixel_32": pixel_32,
+        "pixel_16": pixel_16,
+        "edge": F.l1_loss(fake_gradient, real_gradient),
+        "ssim": _ssim_loss(fake, aligned_real),
+    }
+
+
+def weighted_aligned_structure_loss(
+        fake: torch.Tensor, real: torch.Tensor, *, pixel_64_weight: float = 1.0,
+        pixel_32_weight: float = 0.5, pixel_16_weight: float = 0.25,
+        edge_weight: float = 0.5, ssim_weight: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """V1 structure loss with independently switchable spatial subterms.
+
+    Default coefficients reproduce :func:`multiscale_structure_loss` exactly.
+    The pixel denominator intentionally remains the original 1.75 when a term
+    is disabled: an ablation should reveal both its spatial and loss-magnitude
+    effects instead of silently re-scaling the remaining objectives.
+    """
+    terms = aligned_structure_terms(fake, real)
+    total = (
+        (pixel_64_weight * terms["pixel_64"]
+         + pixel_32_weight * terms["pixel_32"]
+         + pixel_16_weight * terms["pixel_16"]) / 1.75
+        + edge_weight * terms["edge"]
+        + ssim_weight * terms["ssim"]
+    )
+    return total, terms
+
+
 def sar_statistics_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
     """Match radiometry and edge-energy moments without assuming registration."""
     fake_x, real_x = (fake + 1) * .5, (real + 1) * .5
@@ -465,13 +512,13 @@ def sar_perceptual_pyramid_loss(fake_pyramid: tuple[torch.Tensor, ...],
     return total / sum(weights)
 
 
-def sar_physics_prior_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
-    """Physics-inspired amplitude, scattering-centre and speckle constraints.
+def aligned_physics_terms(fake: torch.Tensor, real: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Expose V1 physics-prior subterms for controlled ablations.
 
-    This is deliberately an image-domain prior rather than a claim of full
-    electromagnetic simulation: it aligns the log-amplitude distribution,
-    spatially sparse bright scattering response and short-range correlation of
-    coherent-speckle observations with the matched real SAR target.
+    This intentionally retains V1's weak translation selection.  In
+    particular, ``scatter`` is the position-sensitive scattering-map term
+    that must be tested independently rather than being removed together with
+    the amplitude-distribution and local-correlation priors.
     """
     real = _align_translation(fake, real)
     fake_a, real_a = (fake + 1) * .5, (real + 1) * .5
@@ -502,7 +549,34 @@ def sar_physics_prior_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.Tens
 
     correlation_loss = sum(F.l1_loss(correlation(fake_log, dy, dx), correlation(real_log, dy, dx))
                            for dy, dx in ((0, 1), (1, 0), (1, 1))) / 3
-    return amplitude + scatter + correlation_loss
+    return {
+        "amplitude": amplitude,
+        "scatter": scatter,
+        "correlation": correlation_loss,
+    }
+
+
+def weighted_physics_prior_loss(
+        fake: torch.Tensor, real: torch.Tensor, *, amplitude_weight: float = 1.0,
+        scatter_weight: float = 1.0, correlation_weight: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """The V1 physics prior with independently switchable subterms.
+
+    Default weights reproduce :func:`sar_physics_prior_loss` exactly.  The
+    caller can therefore isolate the exact scattering-map L1 without changing
+    the broader amplitude and short-range speckle assumptions.
+    """
+    terms = aligned_physics_terms(fake, real)
+    total = (amplitude_weight * terms["amplitude"]
+             + scatter_weight * terms["scatter"]
+             + correlation_weight * terms["correlation"])
+    return total, terms
+
+
+def sar_physics_prior_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
+    """Physics-inspired amplitude, scattering-centre and speckle constraints."""
+    total, _ = weighted_physics_prior_loss(fake, real)
+    return total
 
 
 def initialise(module: nn.Module) -> None:

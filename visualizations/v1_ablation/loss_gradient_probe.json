@@ -1,0 +1,93 @@
+{
+  "checkpoint": "/data/newdata/A25_T37_down_大图/code/runs/continuous_spatial_x_hh/best.pt",
+  "batches": 4,
+  "losses": {
+    "rgb_identity": {
+      "raw": 0.1918339654803276,
+      "weight": 10.0,
+      "weighted_contribution": 1.9183396995067596,
+      "encoder_gradient_l2": 15.835153341293335,
+      "generator_gradient_l2": 0.0
+    },
+    "cross_view": {
+      "raw": 0.01242247223854065,
+      "weight": 2.0,
+      "weighted_contribution": 0.0248449444770813,
+      "encoder_gradient_l2": 1.2324902713298798,
+      "generator_gradient_l2": 0.0
+    },
+    "sar_class": {
+      "raw": 0.19265073537826538,
+      "weight": 12.0,
+      "weighted_contribution": 2.3118088245391846,
+      "encoder_gradient_l2": 15.01971971988678,
+      "generator_gradient_l2": 19.65464186668396
+    },
+    "cluster": {
+      "raw": 0.26405473053455353,
+      "weight": 5.0,
+      "weighted_contribution": 1.3202736675739288,
+      "encoder_gradient_l2": 6.520687580108643,
+      "generator_gradient_l2": 10.57008957862854
+    },
+    "structure": {
+      "raw": 0.49758273363113403,
+      "weight": 20.0,
+      "weighted_contribution": 9.95165491104126,
+      "encoder_gradient_l2": 18.854602098464966,
+      "generator_gradient_l2": 32.03841972351074
+    },
+    "statistics": {
+      "raw": 0.08794624917209148,
+      "weight": 5.0,
+      "weighted_contribution": 0.43973124772310257,
+      "encoder_gradient_l2": 1.2786656618118286,
+      "generator_gradient_l2": 1.9881587326526642
+    },
+    "physics": {
+      "raw": 0.47551143914461136,
+      "weight": 3.0,
+      "weighted_contribution": 1.4265343248844147,
+      "encoder_gradient_l2": 5.648483633995056,
+      "generator_gradient_l2": 8.814194202423096
+    },
+    "perceptual": {
+      "raw": 0.162392046302557,
+      "weight": 0.0,
+      "weighted_contribution": 0.0,
+      "encoder_gradient_l2": 0.0,
+      "generator_gradient_l2": 0.0
+    },
+    "angle": {
+      "raw": 0.013449848163872957,
+      "weight": 0.2,
+      "weighted_contribution": 0.002689969725906849,
+      "encoder_gradient_l2": 0.018232666421681643,
+      "generator_gradient_l2": 0.018517562188208103
+    },
+    "adversarial": {
+      "raw": -2.695206046104431,
+      "weight": 2.0,
+      "weighted_contribution": -5.390412092208862,
+      "encoder_gradient_l2": 10.88544499874115,
+      "generator_gradient_l2": 20.29089641571045
+    },
+    "feature_match": {
+      "raw": 0.0073348539881408215,
+      "weight": 5.0,
+      "weighted_contribution": 0.03667426947504282,
+      "encoder_gradient_l2": 0.0709745679050684,
+      "generator_gradient_l2": 0.12571713514626026
+    }
+  },
+  "diagnostics": {
+    "native_class_accuracy": 1.0,
+    "cluster_cosine": 0.7359452694654465
+  },
+  "interpretation": {
+    "weighted_contribution": "weight times mean raw loss; not sufficient by itself",
+    "encoder_gradient_l2": "actual weighted gradient norm delivered to RGB encoder",
+    "generator_gradient_l2": "actual weighted gradient norm delivered to SAR generator",
+    "selection": "low-value candidates have both tiny weighted contribution and tiny generator gradient; test one change at a time"
+  }
+}

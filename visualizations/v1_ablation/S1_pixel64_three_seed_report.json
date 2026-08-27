@@ -1,0 +1,267 @@
+{
+  "pairs": [
+    {
+      "seed": "2718",
+      "control": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/S1_control",
+      "candidate": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/S1_no_pixel64",
+      "screen_pass": true,
+      "screen_gates": {
+        "identity": {
+          "metric": "validation_generated_identity",
+          "value": 0.9875,
+          "relation": ">=",
+          "threshold": 0.970625,
+          "passed": true
+        },
+        "depression": {
+          "metric": "validation_generated_depression",
+          "value": 0.5671875,
+          "relation": ">=",
+          "threshold": 0.5140625,
+          "passed": true
+        },
+        "azimuth_mae": {
+          "metric": "validation_generated_azimuth_mae",
+          "value": 40.626406860351565,
+          "relation": "<=",
+          "threshold": 44.20653247833252,
+          "passed": true
+        },
+        "pair_30_error": {
+          "metric": "validation_pair_30_error",
+          "value": 49.575670433044436,
+          "relation": "<=",
+          "threshold": 53.39062786102295,
+          "passed": true
+        },
+        "feature_cosine": {
+          "metric": "validation_feature_cosine",
+          "value": 0.5167028501629829,
+          "relation": ">=",
+          "threshold": 0.48671755611896517,
+          "passed": true
+        },
+        "aligned_lowpass": {
+          "metric": "validation_aligned_lowpass_l1",
+          "value": 0.14343151897192002,
+          "relation": "<=",
+          "threshold": 0.17183436781167985,
+          "passed": true
+        },
+        "angle_response": {
+          "metric": "validation_response_lowpass_l1_30",
+          "value": 0.110333251953125,
+          "relation": ">=",
+          "threshold": 0.05434417724609375,
+          "passed": true
+        }
+      },
+      "transfer_control": {
+        "tstr_identity_top1": 0.9921875,
+        "tstr_depression_top1": 0.7906249761581421,
+        "tstr_azimuth_degree_mae": 28.915027618408203
+      },
+      "transfer_candidate": {
+        "tstr_identity_top1": 0.989062488079071,
+        "tstr_depression_top1": 0.807812511920929,
+        "tstr_azimuth_degree_mae": 29.487239837646484
+      },
+      "transfer_delta_candidate_minus_control": {
+        "tstr_identity_top1": -0.003125011920928955,
+        "tstr_depression_top1": 0.017187535762786865,
+        "tstr_azimuth_degree_mae": 0.5722122192382812
+      },
+      "transfer_nonregression_pass": true
+    },
+    {
+      "seed": "451",
+      "control": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/S1_seed451_control",
+      "candidate": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/S1_seed451_no_pixel64",
+      "screen_pass": true,
+      "screen_gates": {
+        "identity": {
+          "metric": "validation_generated_identity",
+          "value": 0.9984375,
+          "relation": ">=",
+          "threshold": 0.9753125,
+          "passed": true
+        },
+        "depression": {
+          "metric": "validation_generated_depression",
+          "value": 0.5453125,
+          "relation": ">=",
+          "threshold": 0.5125,
+          "passed": true
+        },
+        "azimuth_mae": {
+          "metric": "validation_generated_azimuth_mae",
+          "value": 39.324881076812744,
+          "relation": "<=",
+          "threshold": 43.666222381591794,
+          "passed": true
+        },
+        "pair_30_error": {
+          "metric": "validation_pair_30_error",
+          "value": 45.70021572113037,
+          "relation": "<=",
+          "threshold": 49.88343095779419,
+          "passed": true
+        },
+        "feature_cosine": {
+          "metric": "validation_feature_cosine",
+          "value": 0.5172641038894653,
+          "relation": ">=",
+          "threshold": 0.4885298949480057,
+          "passed": true
+        },
+        "aligned_lowpass": {
+          "metric": "validation_aligned_lowpass_l1",
+          "value": 0.14905650094151496,
+          "relation": "<=",
+          "threshold": 0.1771402108669281,
+          "passed": true
+        },
+        "angle_response": {
+          "metric": "validation_response_lowpass_l1_30",
+          "value": 0.1244384765625,
+          "relation": ">=",
+          "threshold": 0.06080474853515625,
+          "passed": true
+        }
+      },
+      "transfer_control": {
+        "tstr_identity_top1": 0.9906250238418579,
+        "tstr_depression_top1": 0.7890625,
+        "tstr_azimuth_degree_mae": 26.111736297607422
+      },
+      "transfer_candidate": {
+        "tstr_identity_top1": 0.9859374761581421,
+        "tstr_depression_top1": 0.793749988079071,
+        "tstr_azimuth_degree_mae": 27.757320404052734
+      },
+      "transfer_delta_candidate_minus_control": {
+        "tstr_identity_top1": -0.00468754768371582,
+        "tstr_depression_top1": 0.004687488079071045,
+        "tstr_azimuth_degree_mae": 1.6455841064453125
+      },
+      "transfer_nonregression_pass": true
+    },
+    {
+      "seed": "9201",
+      "control": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/S1_seed9201_control",
+      "candidate": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/S1_seed9201_no_pixel64",
+      "screen_pass": true,
+      "screen_gates": {
+        "identity": {
+          "metric": "validation_generated_identity",
+          "value": 0.990625,
+          "relation": ">=",
+          "threshold": 0.9690624999999999,
+          "passed": true
+        },
+        "depression": {
+          "metric": "validation_generated_depression",
+          "value": 0.5640625,
+          "relation": ">=",
+          "threshold": 0.5093749999999999,
+          "passed": true
+        },
+        "azimuth_mae": {
+          "metric": "validation_generated_azimuth_mae",
+          "value": 39.43373622894287,
+          "relation": "<=",
+          "threshold": 41.93691425323486,
+          "passed": true
+        },
+        "pair_30_error": {
+          "metric": "validation_pair_30_error",
+          "value": 47.943794059753415,
+          "relation": "<=",
+          "threshold": 51.52825927734375,
+          "passed": true
+        },
+        "feature_cosine": {
+          "metric": "validation_feature_cosine",
+          "value": 0.5195339411497116,
+          "relation": ">=",
+          "threshold": 0.48973739266395566,
+          "passed": true
+        },
+        "aligned_lowpass": {
+          "metric": "validation_aligned_lowpass_l1",
+          "value": 0.1442694440484047,
+          "relation": "<=",
+          "threshold": 0.1735712069272995,
+          "passed": true
+        },
+        "angle_response": {
+          "metric": "validation_response_lowpass_l1_30",
+          "value": 0.1144256591796875,
+          "relation": ">=",
+          "threshold": 0.05676422119140625,
+          "passed": true
+        }
+      },
+      "transfer_control": {
+        "tstr_identity_top1": 0.987500011920929,
+        "tstr_depression_top1": 0.7906249761581421,
+        "tstr_azimuth_degree_mae": 31.296987533569336
+      },
+      "transfer_candidate": {
+        "tstr_identity_top1": 0.984375,
+        "tstr_depression_top1": 0.768750011920929,
+        "tstr_azimuth_degree_mae": 31.106441497802734
+      },
+      "transfer_delta_candidate_minus_control": {
+        "tstr_identity_top1": -0.003125011920928955,
+        "tstr_depression_top1": -0.021874964237213135,
+        "tstr_azimuth_degree_mae": -0.19054603576660156
+      },
+      "transfer_nonregression_pass": false
+    }
+  ],
+  "transfer_delta_candidate_minus_control": {
+    "tstr_identity_top1": {
+      "mean": -0.0036458571751912436,
+      "population_stddev": 0.0007365864224753914,
+      "minimum": -0.00468754768371582,
+      "maximum": -0.003125011920928955,
+      "per_seed": [
+        -0.003125011920928955,
+        -0.00468754768371582,
+        -0.003125011920928955
+      ]
+    },
+    "tstr_depression_top1": {
+      "mean": 1.9868214925130207e-08,
+      "population_stddev": 0.016288011853985127,
+      "minimum": -0.021874964237213135,
+      "maximum": 0.017187535762786865,
+      "per_seed": [
+        0.017187535762786865,
+        0.004687488079071045,
+        -0.021874964237213135
+      ]
+    },
+    "tstr_azimuth_degree_mae": {
+      "mean": 0.6757500966389974,
+      "population_stddev": 0.753163790874765,
+      "minimum": -0.19054603576660156,
+      "maximum": 1.6455841064453125,
+      "per_seed": [
+        0.5722122192382812,
+        1.6455841064453125,
+        -0.19054603576660156
+      ]
+    }
+  },
+  "all_screen_gates_pass": true,
+  "all_primary_nonregressing": false,
+  "consistent_primary_improvements": {
+    "tstr_identity_top1": false,
+    "tstr_depression_top1": false,
+    "tstr_azimuth_degree_mae": false
+  },
+  "decision": "advance to a longer confirmation only when all gates and transfer non-regression pass; choose an automatic replacement only with a consistent primary improvement",
+  "native_classifier": "intentionally excluded from all selection logic"
+}

@@ -1,0 +1,192 @@
+{
+  "control": {
+    "directory": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/L2_control",
+    "run_epoch": 4,
+    "epoch": 78,
+    "metrics": {
+      "validation_generated_identity": 0.9828125,
+      "validation_generated_depression": 0.528125,
+      "validation_generated_azimuth_mae": 40.47432413101196,
+      "validation_pair_30_error": 48.601193809509276,
+      "validation_feature_cosine": 0.510848069190979,
+      "validation_aligned_lowpass_l1": 0.1425650507211685,
+      "validation_response_lowpass_l1_30": 0.10794677734375
+    },
+    "native_fake_accuracy_diagnostic": 0.9985
+  },
+  "candidates": [
+    {
+      "directory": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/L2a_cluster_1",
+      "run_epoch": 4,
+      "epoch": 78,
+      "metrics": {
+        "validation_generated_identity": 0.971875,
+        "validation_generated_depression": 0.5,
+        "validation_generated_azimuth_mae": 37.42650327682495,
+        "validation_pair_30_error": 48.04049549102783,
+        "validation_feature_cosine": 0.4893620744347572,
+        "validation_aligned_lowpass_l1": 0.142787005007267,
+        "validation_response_lowpass_l1_30": 0.108966064453125
+      },
+      "native_fake_accuracy_diagnostic": 0.99325,
+      "changed_configuration": {
+        "sar_class_weight": 1.0,
+        "cluster_weight": 1.0,
+        "structure_weight": 20.0,
+        "structure_pixel_64_weight": 1.0,
+        "structure_pixel_32_weight": 0.5,
+        "structure_pixel_16_weight": 0.25,
+        "structure_edge_weight": 0.5,
+        "structure_ssim_weight": 1.0,
+        "physics_scatter_weight": 1.0,
+        "angle_loss_mode": "first_order",
+        "angle_smooth_weight": 0.2,
+        "discriminator_condition": "full",
+        "wrong_azimuth_discriminator_weight": 0.0,
+        "cross_view_weight": 2.0,
+        "adversarial_weight": 2.0
+      },
+      "gates": {
+        "identity": {
+          "metric": "validation_generated_identity",
+          "value": 0.971875,
+          "relation": ">=",
+          "threshold": 0.9628125,
+          "passed": true
+        },
+        "depression": {
+          "metric": "validation_generated_depression",
+          "value": 0.5,
+          "relation": ">=",
+          "threshold": 0.47812499999999997,
+          "passed": true
+        },
+        "azimuth_mae": {
+          "metric": "validation_generated_azimuth_mae",
+          "value": 37.42650327682495,
+          "relation": "<=",
+          "threshold": 45.47432413101196,
+          "passed": true
+        },
+        "pair_30_error": {
+          "metric": "validation_pair_30_error",
+          "value": 48.04049549102783,
+          "relation": "<=",
+          "threshold": 53.601193809509276,
+          "passed": true
+        },
+        "feature_cosine": {
+          "metric": "validation_feature_cosine",
+          "value": 0.4893620744347572,
+          "relation": ">=",
+          "threshold": 0.480848069190979,
+          "passed": true
+        },
+        "aligned_lowpass": {
+          "metric": "validation_aligned_lowpass_l1",
+          "value": 0.142787005007267,
+          "relation": "<=",
+          "threshold": 0.1725650507211685,
+          "passed": true
+        },
+        "angle_response": {
+          "metric": "validation_response_lowpass_l1_30",
+          "value": 0.108966064453125,
+          "relation": ">=",
+          "threshold": 0.053973388671875,
+          "passed": true
+        }
+      },
+      "screen_pass": true
+    },
+    {
+      "directory": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/L2b_cluster_0",
+      "run_epoch": 4,
+      "epoch": 78,
+      "metrics": {
+        "validation_generated_identity": 0.95,
+        "validation_generated_depression": 0.5015625,
+        "validation_generated_azimuth_mae": 35.69117212295532,
+        "validation_pair_30_error": 45.8063042640686,
+        "validation_feature_cosine": 0.48180408626794813,
+        "validation_aligned_lowpass_l1": 0.1427046310156584,
+        "validation_response_lowpass_l1_30": 0.1112091064453125
+      },
+      "native_fake_accuracy_diagnostic": 0.9875,
+      "changed_configuration": {
+        "sar_class_weight": 1.0,
+        "cluster_weight": 0.0,
+        "structure_weight": 20.0,
+        "structure_pixel_64_weight": 1.0,
+        "structure_pixel_32_weight": 0.5,
+        "structure_pixel_16_weight": 0.25,
+        "structure_edge_weight": 0.5,
+        "structure_ssim_weight": 1.0,
+        "physics_scatter_weight": 1.0,
+        "angle_loss_mode": "first_order",
+        "angle_smooth_weight": 0.2,
+        "discriminator_condition": "full",
+        "wrong_azimuth_discriminator_weight": 0.0,
+        "cross_view_weight": 2.0,
+        "adversarial_weight": 2.0
+      },
+      "gates": {
+        "identity": {
+          "metric": "validation_generated_identity",
+          "value": 0.95,
+          "relation": ">=",
+          "threshold": 0.9628125,
+          "passed": false
+        },
+        "depression": {
+          "metric": "validation_generated_depression",
+          "value": 0.5015625,
+          "relation": ">=",
+          "threshold": 0.47812499999999997,
+          "passed": true
+        },
+        "azimuth_mae": {
+          "metric": "validation_generated_azimuth_mae",
+          "value": 35.69117212295532,
+          "relation": "<=",
+          "threshold": 45.47432413101196,
+          "passed": true
+        },
+        "pair_30_error": {
+          "metric": "validation_pair_30_error",
+          "value": 45.8063042640686,
+          "relation": "<=",
+          "threshold": 53.601193809509276,
+          "passed": true
+        },
+        "feature_cosine": {
+          "metric": "validation_feature_cosine",
+          "value": 0.48180408626794813,
+          "relation": ">=",
+          "threshold": 0.480848069190979,
+          "passed": true
+        },
+        "aligned_lowpass": {
+          "metric": "validation_aligned_lowpass_l1",
+          "value": 0.1427046310156584,
+          "relation": "<=",
+          "threshold": 0.1725650507211685,
+          "passed": true
+        },
+        "angle_response": {
+          "metric": "validation_response_lowpass_l1_30",
+          "value": 0.1112091064453125,
+          "relation": ">=",
+          "threshold": 0.053973388671875,
+          "passed": true
+        }
+      },
+      "screen_pass": false
+    }
+  ],
+  "policy": {
+    "screen": "all gates must pass before a candidate can advance",
+    "selection": "among passing candidates, retain only Pareto improvements; do not rank native classifier accuracy",
+    "confirmation": "retrain each winner and its parent from the same early V1 checkpoint with at least three seeds"
+  }
+}

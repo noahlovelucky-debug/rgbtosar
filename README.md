@@ -1,9 +1,24 @@
 # RGB to SAR
 
-Research code for conditional RGB-to-SAR vehicle ROI generation. The current
-training entry point is `code/train_continuous_spatial_roi_gan.py`.
+Research code for conditional RGB-to-SAR vehicle ROI generation.
 
-## Fused V2
+## V1 Ablation (Active)
+
+The active experiment path is the preserved V1 PatchGAN, not Fused V2. It
+changes one loss or discriminator property at a time from the same V1
+milestone, uses a fixed balanced holdout proxy, and selects with a frozen
+real-SAR geometry validator plus generated-to-real transfer probes. See
+[`code/V1_ABLATION_PROTOCOL.md`](code/V1_ABLATION_PROTOCOL.md).
+
+Three matched short screens found that reducing V1 `sar_class_weight` from 12
+to 1 improves generated-to-real identity transfer while retaining all frozen
+geometry gates. In contrast, removing only the weak, translation-aligned 64px
+pixel term has no consistent transfer benefit and is not the default change.
+The prototype-cluster objective cannot be removed outright; it remains at its
+V1 value pending a matched-seed calibration. Artifacts are under
+[`visualizations/v1_ablation/`](visualizations/v1_ablation/).
+
+## Fused V2 (Historical)
 
 `continuous_spatial_fused_v2` uses a single K+1 SAR classifier-discriminator:
 40 logits represent real vehicle identities and one logit represents generated
@@ -13,7 +28,8 @@ physics, and angular-curvature objectives.
 
 The non-registered structure objective compares low-frequency distributions,
 residual/Sobel statistics, and discriminator feature moments. It does not
-compare aligned SAR pixels.
+compare aligned SAR pixels. This run changed too many variables at once and is
+kept only as a diagnostic reference, not as the current baseline.
 
 ## Layout
 
@@ -22,6 +38,8 @@ compare aligned SAR pixels.
   previews, all-depression rendering, training history, and audit metrics.
 - `visualizations/continuous_spatial_fused_v2/`: final Fused V2 training history,
   previews, a full azimuth/depression scan, and test audit metrics.
+- `visualizations/v1_ablation/`: V1 loss-gradient probe, fixed-proxy milestone
+  audits, paired L1/S1 screen data, previews, and multi-seed comparison plots.
 
 Datasets, model checkpoints, and generated run directories are intentionally
 excluded from this repository.

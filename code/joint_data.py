@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import random
 import hashlib
+import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -80,6 +81,77 @@ class JointROIDataset(Dataset):
             raise RuntimeError(f"RGB is missing classes: {missing_classes}")
         self.rgb_naming = ",".join(sorted(naming_formats))
 
+        records = self._load_sar_records(band, polarization, depression)
+        if not records:
+            raise RuntimeError(f"no valid joint records under {self.sar_root}")
+        self.records = records
+        self.epoch_size = epoch_size or len(records)
+        self.random_epoch = 0 < epoch_size < len(records)
+        self._rgb_cache: dict[Path, torch.Tensor] = {}
+        # Populate once in the parent process. DataLoader fork workers then
+        # share these read-only base tensors via copy-on-write instead of each
+        # worker decoding the same 466 PNG files independently.
+        if preload_rgb:
+            self._preload_rgb_cache(sorted(set(self.rgb_paths.values())))
+
+    def _record_cache_signature(self, band: str, polarization: str,
+                                depression: str) -> dict[str, object]:
+        def directory_mtime(root: Path, name: str) -> int | None:
+            folder = root / name
+            try:
+                return folder.stat().st_mtime_ns
+            except OSError:
+                return None
+
+        return {
+            "version": 1,
+            "sar_root": str(self.sar_root.resolve()),
+            "rgb_root": str(self.rgb_root.resolve()),
+            "band": band,
+            "polarization": polarization,
+            "depression": depression,
+            "sar_class_mtimes": [directory_mtime(self.sar_root, name) for name in self.classes],
+            "rgb_class_mtimes": [directory_mtime(self.rgb_root, name) for name in self.classes],
+        }
+
+    def _record_cache_file(self, band: str, polarization: str, depression: str) -> Path:
+        key = "|".join((str(self.sar_root.resolve()), str(self.rgb_root.resolve()),
+                        band, polarization, depression, "joint-sar-records-v1"))
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        return self.cache_dir / f"joint_sar_records_{digest}.pt"
+
+    def _decode_cached_records(self, records: list[dict[str, object]]) -> list[tuple]:
+        return [
+            (
+                self.sar_root / str(record["tif"]),
+                self.rgb_root / str(record["rgb"]),
+                str(record["class_name"]),
+                tuple(record["bbox"]),
+                dict(record["meta"]),
+                int(record["rgb_angle"]),
+            )
+            for record in records
+        ]
+
+    def _load_sar_records(self, band: str, polarization: str,
+                          depression: str) -> list[tuple]:
+        """Reuse parsed XML records across short ablation processes.
+
+        XML parsing on the network-mounted SOC dataset is much slower than an
+        epoch of GPU training.  The cache stores metadata only and is invalidated
+        when any participating class directory changes.
+        """
+        signature = self._record_cache_signature(band, polarization, depression)
+        cache_file = self._record_cache_file(band, polarization, depression)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        if cache_file.is_file():
+            try:
+                saved = torch.load(cache_file, map_location="cpu", weights_only=True)
+                if saved.get("signature") == signature:
+                    return self._decode_cached_records(saved["records"])
+            except Exception:
+                pass
+
         records = []
         for class_name in self.classes:
             folder = self.sar_root / class_name
@@ -104,17 +176,21 @@ class JointROIDataset(Dataset):
                 rgb_path = self.rgb_paths.get((class_name, rgb_angle))
                 if rgb_path is not None:
                     records.append((tif, rgb_path, class_name, bbox, meta, rgb_angle))
-        if not records:
-            raise RuntimeError(f"no valid joint records under {self.sar_root}")
-        self.records = records
-        self.epoch_size = epoch_size or len(records)
-        self.random_epoch = 0 < epoch_size < len(records)
-        self._rgb_cache: dict[Path, torch.Tensor] = {}
-        # Populate once in the parent process. DataLoader fork workers then
-        # share these read-only base tensors via copy-on-write instead of each
-        # worker decoding the same 466 PNG files independently.
-        if preload_rgb:
-            self._preload_rgb_cache(sorted(set(self.rgb_paths.values())))
+        cache_records = [
+            {
+                "tif": str(tif.relative_to(self.sar_root)),
+                "rgb": str(rgb.relative_to(self.rgb_root)),
+                "class_name": class_name,
+                "bbox": tuple(bbox),
+                "meta": dict(meta),
+                "rgb_angle": rgb_angle,
+            }
+            for tif, rgb, class_name, bbox, meta, rgb_angle in records
+        ]
+        temporary = cache_file.with_suffix(cache_file.suffix + f".{os.getpid()}.tmp")
+        torch.save({"signature": signature, "records": cache_records}, temporary)
+        temporary.replace(cache_file)
+        return records
 
     def __len__(self) -> int:
         return self.epoch_size
