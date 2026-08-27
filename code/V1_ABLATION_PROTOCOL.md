@@ -96,7 +96,7 @@ trained only on generated features; native classifier accuracy is excluded.
 
 | Change | Seeds | Identity top-1 | Depression top-1 | Azimuth MAE | Decision |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `sar_class_weight: 12 -> 1` | 3 | +0.89 pp | +2.14 pp | -2.21 deg | Advance to 2,000-step confirmation |
+| `sar_class_weight: 12 -> 1` | 3 | +0.89 pp | +2.14 pp | -2.21 deg | Short-screen winner; see 2,000-step confirmation below |
 | `sar_class_weight: 12 -> 0` | 3 | +0.31 pp | +2.19 pp | -1.89 deg | Reject: identity is not consistent and one azimuth seed regresses |
 | `cluster_weight: 5 -> 4` | 3 | +0.21 pp | -0.94 pp | -0.29 deg | Reject: one depression seed loses 5.0 pp |
 | `structure_pixel_64_weight: 1 -> 0` | 3 | -0.36 pp | +0.00 pp | +0.68 deg | Reject as default replacement; retain weak aligned 64px term |
@@ -123,11 +123,14 @@ mean is close to neutral only because one seed lost 5.0 percentage points of
 depression transfer. Both weights therefore remain conservative (`1` and `5`)
 while longer confirmations continue.
 
-The one-seed 2,000-step `sar_class=12 -> 1` confirmation also passed every
-screen and transfer gate (identity +0.63 pp, depression +3.13 pp, azimuth
-MAE -2.08 deg). It is a strong continuation candidate, but the final default
-should be changed only after repeating this long screen with at least two
-additional seeds.
+The 2,000-step `sar_class=1` confirmation now covers three matched seeds. Every
+seed passes the screen and transfer non-regression policy; identity improves
+in all three (+0.47 to +1.25 percentage points), depression improves in all
+three (+3.13 to +4.06 points), and mean azimuth MAE improves by 2.31 degrees
+(two seeds improve, one changes by +1.08 degrees). This is sufficient evidence
+to promote `sar_class_weight=1` for the next full V1 run. The ablation trainer
+keeps its default at 12 so that an explicit control remains reproducible; pass
+`--sar-class-weight 1` in the recommended run.
 
 The structure ablations confirm that V1's pixel supervision must be weakened
 selectively, not removed wholesale. Removing the translation-tolerant 64px
@@ -162,6 +165,21 @@ full-condition PatchGAN for the controlled baseline; do not merge the K+1
 classifier/discriminator until a separately validated architecture is shown
 to preserve these transfer metrics.
 
+## Recommended Next Run
+
+Use the preserved V1 architecture with only the validated class-weight change:
+
+```bash
+cd /data/newdata/A25_T37_down_大图/code
+PYTHON_BIN=/home/star/anaconda3/envs/tessera/bin/python ./run_v1_recommended.sh
+```
+
+This continues V1 milestone 70 for 30 epochs (to epoch 100), sets
+`sar_class_weight=1`, and leaves cluster, aligned structure, physics, angle,
+feature-match, and full-condition PatchGAN at their V1 values. It is separate
+from the ablation control entry point, whose default `sar_class_weight=12`
+must remain unchanged for future paired experiments.
+
 The paired artifacts are kept under `runs/v1_ablation/`:
 `S2_ssim_1_to_0_three_seed_report.json`,
 `S3_edge_05_to_0_three_seed_report.json`,
@@ -170,5 +188,6 @@ The paired artifacts are kept under `runs/v1_ablation/`:
 `A1_curvature_vs_P1_three_seed_report.json`,
 `D1_target_vs_P1_three_seed_report.json`,
 `D2_target_wrong_az_vs_P1_three_seed_report.json`, and
-`D2_wrong_az_increment_three_seed_report.json`. Their PNG counterparts are
+`D2_wrong_az_increment_three_seed_report.json`, and
+`L1_sar_class_12_to_1_2000_three_seed_report.json`. Their PNG counterparts are
 intended for visual inspection, but the JSON values are the selection record.

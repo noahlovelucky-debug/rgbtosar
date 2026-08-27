@@ -13,7 +13,10 @@ real-SAR geometry validator plus generated-to-real transfer probes. See
 Three matched short screens found that reducing V1 `sar_class_weight` from 12
 to 1 improves generated-to-real identity transfer while retaining all frozen
 geometry gates; a 2,000-step confirmation also improved all three primary
-transfer axes in the tested seed. In contrast, removing only the weak,
+transfer axes in all three matched seeds (identity +0.78 pp, depression +3.59
+pp, azimuth MAE -2.31 degrees on average). The recommended next run therefore
+passes `--sar-class-weight 1` while keeping all other V1 coefficients unchanged.
+In contrast, removing only the weak,
 translation-aligned 64px pixel term has no consistent transfer benefit and is
 not the default change. The prototype-cluster objective cannot be removed or
 lightly reduced without a depression-transfer regression in the current
