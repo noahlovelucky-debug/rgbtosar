@@ -97,6 +97,8 @@ trained only on generated features; native classifier accuracy is excluded.
 | Change | Seeds | Identity top-1 | Depression top-1 | Azimuth MAE | Decision |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `sar_class_weight: 12 -> 1` | 3 | +0.89 pp | +2.14 pp | -2.21 deg | Advance to 2,000-step confirmation |
+| `sar_class_weight: 12 -> 0` | 3 | +0.31 pp | +2.19 pp | -1.89 deg | Reject: identity is not consistent and one azimuth seed regresses |
+| `cluster_weight: 5 -> 4` | 3 | +0.21 pp | -0.94 pp | -0.29 deg | Reject: one depression seed loses 5.0 pp |
 | `structure_pixel_64_weight: 1 -> 0` | 3 | -0.36 pp | +0.00 pp | +0.68 deg | Reject as default replacement; retain weak aligned 64px term |
 
 For `sar_class=1`, all three short screens passed the frozen geometry gates;
@@ -107,6 +109,15 @@ consistently. This is evidence for keeping the weakly translation-aligned
 pixel term in V1; it does not justify reintroducing a rigid unaligned pixel
 loss.
 
-The `cluster_weight` screen is not yet multi-seed confirmed. Removing it
-outright damaged identity/depression in the first screen, so it remains at 5
-until a separate matched-seed calibration can establish a safe reduction.
+The `sar_class=0` screen improved depression on average but failed the
+non-regression policy because identity was worse in two seeds and azimuth
+regressed by 2.9 degrees in one. The `cluster=4` screen likewise failed: its
+mean is close to neutral only because one seed lost 5.0 percentage points of
+depression transfer. Both weights therefore remain conservative (`1` and `5`)
+while longer confirmations continue.
+
+The one-seed 2,000-step `sar_class=12 -> 1` confirmation also passed every
+screen and transfer gate (identity +0.63 pp, depression +3.13 pp, azimuth
+MAE -2.08 deg). It is a strong continuation candidate, but the final default
+should be changed only after repeating this long screen with at least two
+additional seeds.

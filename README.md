@@ -12,10 +12,12 @@ real-SAR geometry validator plus generated-to-real transfer probes. See
 
 Three matched short screens found that reducing V1 `sar_class_weight` from 12
 to 1 improves generated-to-real identity transfer while retaining all frozen
-geometry gates. In contrast, removing only the weak, translation-aligned 64px
-pixel term has no consistent transfer benefit and is not the default change.
-The prototype-cluster objective cannot be removed outright; it remains at its
-V1 value pending a matched-seed calibration. Artifacts are under
+geometry gates; a 2,000-step confirmation also improved all three primary
+transfer axes in the tested seed. In contrast, removing only the weak,
+translation-aligned 64px pixel term has no consistent transfer benefit and is
+not the default change. The prototype-cluster objective cannot be removed or
+lightly reduced without a depression-transfer regression in the current
+screens, so it remains at its V1 value. Artifacts are under
 [`visualizations/v1_ablation/`](visualizations/v1_ablation/).
 
 ## Fused V2 (Historical)

@@ -4,7 +4,10 @@
 `S1_pixel64_three_seed.png` show paired generated-to-real transfer deltas for
 three matched random seeds. The first supports reducing V1 `sar_class_weight`
 from 12 to 1; the second rejects removing the weak aligned 64px pixel term as
-the default change. `*_transfer.json` reports a generated-to-real (TSTR)
+the default change. `L1_sar_class_12_to_0_three_seed.png` and
+`L2_cluster_5_to_4_three_seed.png` document the corresponding rejected
+classification and cluster reductions. `*_transfer.json` reports a
+generated-to-real (TSTR)
 probe: small readouts train only on generated frozen features and are evaluated
 on held-out real SAR features. This prevents the native SAR classifier used in
 V1's loss from serving as its own scorekeeper.
