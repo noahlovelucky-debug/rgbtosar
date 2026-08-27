@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+# Datasets and trained weights
+data/
+datasets/
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.7z
+
+# Runtime output, except curated visualizations/ committed separately
+runs/
+server_results/
+*.log
+.joint_rgb_cache_*.pt

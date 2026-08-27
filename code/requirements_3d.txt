@@ -1,0 +1,5 @@
+# Install after requirements.txt in the CUDA training environment.
+gsplat==1.5.3
+pycolmap==3.13.0
+opencv-python-headless==4.10.0.84
+scipy>=1.14,<1.15
