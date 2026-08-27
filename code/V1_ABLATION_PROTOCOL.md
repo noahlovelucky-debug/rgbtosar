@@ -82,6 +82,8 @@ sealed until that point.
 | D1 | A1 | `discriminator_condition: full -> target` | Removes source RGB angle and nonphysical condition inputs from D |
 | D2 | D1 | `wrong_azimuth_discriminator_weight: 0 -> .25` | Adds one wrong-target angle negative to the same PatchGAN |
 | R1 | best D | `cross_view_weight: 2 -> 0` | Low-priority RGB identity stability test |
+| F1 | P1 control | `feature_match_weight: 5 -> 0` | Tests whether D feature moments are redundant with structure |
+| T1 | P1 control | `statistics_weight: 5 -> 0` | Tests whether global SAR statistics are redundant with structure |
 
 Do not remove all pixel or structure supervision as one experiment. V1's
 translation-tolerant structure objective is its largest generator signal. The
@@ -107,6 +109,9 @@ trained only on generated features; native classifier accuracy is excluded.
 | `angle_loss_mode: first_order -> curvature` | 3 | -0.31 pp | -0.62 pp | +0.59 deg | Reject: depression regresses and one screen gate fails |
 | `discriminator_condition: full -> target` | 3 | -0.52 pp | -0.73 pp | -1.24 deg | Reject: no consistent primary improvement |
 | `wrong-azimuth negative: 0 -> .25` | 3 | -0.47 pp | -1.88 pp | -0.75 deg | Reject: depression regression; keep as diagnostic only |
+| `cross_view_weight: 2 -> 0` | 3 | -0.52 pp | +0.42 pp | +0.00 deg | Reject: identity falls in every seed |
+| `feature_match_weight: 5 -> 0` | 3 | -0.52 pp | -0.57 pp | +0.01 deg | Reject: identity falls in every seed |
+| `statistics_weight: 5 -> 0` | 3 | -0.52 pp | +0.16 pp | +0.81 deg | Reject: one azimuth seed fails |
 
 For `sar_class=1`, all three short screens passed the frozen geometry gates;
 identity transfer improved in every seed. For `pixel64=0`, all geometry gates
@@ -165,6 +170,14 @@ full-condition PatchGAN for the controlled baseline; do not merge the K+1
 classifier/discriminator until a separately validated architecture is shown
 to preserve these transfer metrics.
 
+The low-contribution auxiliary terms are not automatically redundant. Removing
+`cross_view` or `feature_match` passed the short hard gates, but identity
+transfer fell in every seed (about 0.52 percentage points on average), with no
+consistent primary improvement. Removing `statistics` failed one azimuth gate
+and worsened azimuth MAE by 0.81 degrees on average. Keep all three for the
+recommended run; any future simplification should test a smaller coefficient,
+not jump directly from the V1 value to zero.
+
 ## Recommended Next Run
 
 Use the preserved V1 architecture with only the validated class-weight change:
@@ -188,6 +201,9 @@ The paired artifacts are kept under `runs/v1_ablation/`:
 `A1_curvature_vs_P1_three_seed_report.json`,
 `D1_target_vs_P1_three_seed_report.json`,
 `D2_target_wrong_az_vs_P1_three_seed_report.json`, and
-`D2_wrong_az_increment_three_seed_report.json`, and
+`D2_wrong_az_increment_three_seed_report.json`,
+`R1_cross_view_2_to_0_three_seed_report.json`,
+`F1_feature_match_5_to_0_three_seed_report.json`,
+`T1_statistics_5_to_0_three_seed_report.json`, and
 `L1_sar_class_12_to_1_2000_three_seed_report.json`. Their PNG counterparts are
 intended for visual inspection, but the JSON values are the selection record.

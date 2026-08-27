@@ -21,6 +21,13 @@ and `D2_target_wrong_az_vs_P1` show that the discriminator input/negative
 experiments do not yet justify replacing V1's PatchGAN or merging it with the
 classifier.
 
+`R1_cross_view_2_to_0_three_seed.png`, `F1_feature_match_5_to_0_three_seed.png`,
+and `T1_statistics_5_to_0_three_seed.png` cover the remaining small auxiliary
+terms. Zeroing any of them has no consistent primary transfer gain; identity
+falls in every seed for the first two, and the statistics removal also fails an
+azimuth gate. The validated long class-loss confirmation is recorded in
+`L1_sar_class_12_to_1_2000_three_seed.png`.
+
 The milestone audit files show why native fake-class accuracy is not a valid
 selection metric: it is already near 100 percent at V1 epoch 10 while frozen
 geometry and generated-to-real azimuth transfer are still poor. The protocol
