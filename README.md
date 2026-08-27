@@ -20,6 +20,12 @@ lightly reduced without a depression-transfer regression in the current
 screens, so it remains at its V1 value. Artifacts are under
 [`visualizations/v1_ablation/`](visualizations/v1_ablation/).
 
+Follow-up one-variable screens on SSIM, edge, physics scattering, angle
+regularisation, and discriminator conditioning are recorded in the same
+directory. They reject the large Fused V2/K+1 discriminator change for now:
+the existing V1 PatchGAN remains the reproducible baseline, and no change is
+promoted without paired generated-to-real transfer evidence across seeds.
+
 ## Fused V2 (Historical)
 
 `continuous_spatial_fused_v2` uses a single K+1 SAR classifier-discriminator:

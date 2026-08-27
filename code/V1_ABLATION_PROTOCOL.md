@@ -100,6 +100,13 @@ trained only on generated features; native classifier accuracy is excluded.
 | `sar_class_weight: 12 -> 0` | 3 | +0.31 pp | +2.19 pp | -1.89 deg | Reject: identity is not consistent and one azimuth seed regresses |
 | `cluster_weight: 5 -> 4` | 3 | +0.21 pp | -0.94 pp | -0.29 deg | Reject: one depression seed loses 5.0 pp |
 | `structure_pixel_64_weight: 1 -> 0` | 3 | -0.36 pp | +0.00 pp | +0.68 deg | Reject as default replacement; retain weak aligned 64px term |
+| `structure_ssim_weight: 1 -> 0` | 3 | +0.00 pp | +1.41 pp | +2.65 deg | Reject: azimuth worsens in every seed |
+| `structure_edge_weight: .5 -> 0` | 3 | -0.16 pp | -0.47 pp | +0.39 deg | Reject: no consistent primary improvement |
+| `physics_scatter_weight: 1 -> 0` | 3 | -0.21 pp | -0.68 pp | -0.69 deg | Reject: azimuth gain does not offset identity/depression loss |
+| `angle_smooth_weight: .2 -> 0` | 3 | -0.47 pp | +1.04 pp | +0.85 deg | Keep V1 first-order term provisionally; no robust gain from removal |
+| `angle_loss_mode: first_order -> curvature` | 3 | -0.31 pp | -0.62 pp | +0.59 deg | Reject: depression regresses and one screen gate fails |
+| `discriminator_condition: full -> target` | 3 | -0.52 pp | -0.73 pp | -1.24 deg | Reject: no consistent primary improvement |
+| `wrong-azimuth negative: 0 -> .25` | 3 | -0.47 pp | -1.88 pp | -0.75 deg | Reject: depression regression; keep as diagnostic only |
 
 For `sar_class=1`, all three short screens passed the frozen geometry gates;
 identity transfer improved in every seed. For `pixel64=0`, all geometry gates
@@ -121,3 +128,47 @@ screen and transfer gate (identity +0.63 pp, depression +3.13 pp, azimuth
 MAE -2.08 deg). It is a strong continuation candidate, but the final default
 should be changed only after repeating this long screen with at least two
 additional seeds.
+
+The structure ablations confirm that V1's pixel supervision must be weakened
+selectively, not removed wholesale. Removing the translation-tolerant 64px
+term reduced identity transfer in all three seeds. Removing global SSIM made
+azimuth MAE worse in all three seeds (mean +2.65 degrees), while removing the
+edge term had no consistent primary benefit. The retained structure objective
+therefore remains the aligned 64/32/16 terms plus edge and SSIM; this is not a
+rigid unaligned pixel comparison.
+
+The physics scattering-map experiment also does not justify deletion. Its
+removal improved azimuth MAE by 0.69 degrees on average, but identity and
+depression transfer both fell, and one seed exceeded the depression tolerance.
+Keep the full physics prior until a later experiment replaces only its exact
+pixel-like map term with a distributional statistic.
+
+For angle regularisation, setting the weight to zero passed all short hard
+gates and was therefore safe enough to audit, but it lowered identity by 0.47
+percentage points and worsened azimuth MAE by 0.85 degrees on average versus
+the matched P1 controls. The curvature replacement was worse: depression
+transfer fell in two seeds and one short screen failed. The default remains
+the original low-weight first-order term; neither angle variant is promoted
+without a longer, same-parent confirmation.
+
+The discriminator ablations do not support the proposed large fusion change.
+Restricting the existing PatchGAN to target azimuth/depression improved
+azimuth transfer by 1.24 degrees on average, but reduced identity and
+depression transfer and had no consistent primary improvement. Adding a
+wrong-azimuth real negative reduced the apparent gain to 0.75 degrees while
+depression fell 1.88 percentage points. Relative to target-only D, the extra
+negative made azimuth MAE worse by 0.49 degrees on average. Keep the V1
+full-condition PatchGAN for the controlled baseline; do not merge the K+1
+classifier/discriminator until a separately validated architecture is shown
+to preserve these transfer metrics.
+
+The paired artifacts are kept under `runs/v1_ablation/`:
+`S2_ssim_1_to_0_three_seed_report.json`,
+`S3_edge_05_to_0_three_seed_report.json`,
+`P1_scatter_1_to_0_three_seed_report.json`,
+`A0_no_angle_vs_P1_three_seed_report.json`, and
+`A1_curvature_vs_P1_three_seed_report.json`,
+`D1_target_vs_P1_three_seed_report.json`,
+`D2_target_wrong_az_vs_P1_three_seed_report.json`, and
+`D2_wrong_az_increment_three_seed_report.json`. Their PNG counterparts are
+intended for visual inspection, but the JSON values are the selection record.
