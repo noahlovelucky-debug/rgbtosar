@@ -1,0 +1,48 @@
+{
+  "condition": "X/HH; target azimuth is sin/cos conditioned; depressions=15,30,45,60",
+  "source_view_mode": "nearest",
+  "all": {
+    "samples": 5260,
+    "rgb_identity_top1": 1.0,
+    "generated_native_sar_top1": 0.999809885931559,
+    "real_native_sar_top1": 0.9233840304182509,
+    "feature_cosine_to_real": 0.4086563288938863,
+    "structure_loss": 0.007253888745866574,
+    "physics_prior_loss": 1.5762044666384563,
+    "angle_near_delta": 8.671235638080137e-05,
+    "angle_far_delta": 0.00024941686003915114,
+    "angle_far_to_near": 2.8763704557148158
+  },
+  "by_depression": {
+    "15": {
+      "samples": 1167,
+      "rgb_identity_top1": 1.0,
+      "generated_native_sar_top1": 1.0,
+      "real_native_sar_top1": 0.8851756640959726,
+      "feature_cosine_to_real": 0.39811010971576
+    },
+    "30": {
+      "samples": 1353,
+      "rgb_identity_top1": 1.0,
+      "generated_native_sar_top1": 0.9992609016999261,
+      "real_native_sar_top1": 0.9231337767923133,
+      "feature_cosine_to_real": 0.43643483865375615
+    },
+    "45": {
+      "samples": 1354,
+      "rgb_identity_top1": 1.0,
+      "generated_native_sar_top1": 1.0,
+      "real_native_sar_top1": 0.9438700147710487,
+      "feature_cosine_to_real": 0.4373173843986703
+    },
+    "60": {
+      "samples": 1386,
+      "rgb_identity_top1": 1.0,
+      "generated_native_sar_top1": 1.0,
+      "real_native_sar_top1": 0.9357864357864358,
+      "feature_cosine_to_real": 0.36241970102680365
+    }
+  },
+  "gan_checkpoint": "/data/newdata/A25_T37_down_大图/code/runs/continuous_spatial_fused_v2_x_hh/best.pt",
+  "classifier_checkpoint": "/data/newdata/A25_T37_down_大图/code/server_results/sar_native64_multitask_v1/best.pt"
+}

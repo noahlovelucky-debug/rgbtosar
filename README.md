@@ -20,9 +20,8 @@ compare aligned SAR pixels.
 - `code/`: training, evaluation, rendering, models, and data loading.
 - `visualizations/continuous_spatial_v1/`: representative historical V1
   previews, all-depression rendering, training history, and audit metrics.
-- `visualizations/continuous_spatial_fused_v2/`: in-progress Fused V2 training
-  history and the first-epoch preview. This is an early optimisation snapshot,
-  not a final quality claim.
+- `visualizations/continuous_spatial_fused_v2/`: final Fused V2 training history,
+  previews, a full azimuth/depression scan, and test audit metrics.
 
 Datasets, model checkpoints, and generated run directories are intentionally
 excluded from this repository.
@@ -41,8 +40,9 @@ native 64px SAR classifier checkpoint.
 
 ## Fused V2 Run Status
 
-The tracked preview and history were exported after epoch 1 of the active
-100-epoch run. The following later checks completed through epoch 3 without
-NaN, CUDA OOM, or training-process errors: RGB identity accuracy reached
-0.976, real SAR class accuracy 0.983, and generated-SAR rejection accuracy
-0.977. Checkpoints, source data, and raw logs remain local and are excluded.
+The 100-epoch Fused V2 run completed without NaN, CUDA OOM, or process errors.
+The tracked audit covers 5,260 test samples: RGB identity top-1 is 1.000,
+generated SAR native-classifier top-1 is 0.9998, real SAR native-classifier
+top-1 is 0.9234, and feature cosine to real SAR is 0.4087. These values are
+diagnostic measurements, not an independent perceptual-quality claim.
+Checkpoints, source data, and raw logs remain local and are excluded.
