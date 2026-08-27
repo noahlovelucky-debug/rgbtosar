@@ -28,6 +28,12 @@ falls in every seed for the first two, and the statistics removal also fails an
 azimuth gate. The validated long class-loss confirmation is recorded in
 `L1_sar_class_12_to_1_2000_three_seed.png`.
 
+The recommended epoch-100 run is available as
+`recommended_sar_class_1_preview_0100.png` and
+`recommended_sar_class_1_metrics.png`; its independent transfer result is in
+`recommended_sar_class_1_transfer.json` and the raw validation history is in
+`recommended_sar_class_1_history.csv`.
+
 The milestone audit files show why native fake-class accuracy is not a valid
 selection metric: it is already near 100 percent at V1 epoch 10 while frozen
 geometry and generated-to-real azimuth transfer are still poor. The protocol

@@ -29,6 +29,11 @@ directory. They reject the large Fused V2/K+1 discriminator change for now:
 the existing V1 PatchGAN remains the reproducible baseline, and no change is
 promoted without paired generated-to-real transfer evidence across seeds.
 
+The recommended epoch-100 run completed without NaN/OOM. Its independent
+generated-to-real transfer is identity `98.59%`, depression `85.16%`, and
+azimuth MAE `23.07°`; preview, metrics, history, and JSON are in
+[`visualizations/v1_ablation/`](visualizations/v1_ablation/).
+
 ## Fused V2 (Historical)
 
 `continuous_spatial_fused_v2` uses a single K+1 SAR classifier-discriminator:

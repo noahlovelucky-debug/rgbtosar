@@ -1,0 +1,34 @@
+{
+  "architecture": "continuous_spatial_v1_ablation",
+  "gan_checkpoint": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/recommended_sar_class_1/epoch_0100.pt",
+  "geometry_validator_checkpoint": "/data/newdata/A25_T37_down_大图/code/server_results/sar_geometry_validator_xhh_v2/best.pt",
+  "split_manifest": "/data/newdata/A25_T37_down_大图/code/runs/v1_ablation/split.json",
+  "observed": true,
+  "speckle_strength": 0.32,
+  "samples": {
+    "generated_train": 1920,
+    "real_validation": 640
+  },
+  "generated_to_real": {
+    "identity_top1": 0.9859374761581421,
+    "depression_top1": 0.8515625,
+    "azimuth_degree_mae": 23.069637298583984
+  },
+  "real_to_real_reference": {
+    "identity_top1": 0.995312511920929,
+    "depression_top1": 0.984375,
+    "azimuth_degree_mae": 8.79412841796875
+  },
+  "real_to_generated": {
+    "identity_top1": 0.9921875,
+    "depression_top1": 0.6031249761581421,
+    "azimuth_degree_mae": 33.724891662597656
+  },
+  "paired_validation_feature_cosine": 0.5321317315101624,
+  "interpretation": {
+    "generated_to_real": "primary transfer metric; higher identity/depression and lower azimuth MAE are better",
+    "real_to_real_reference": "upper-reference for the same fixed feature/readout procedure",
+    "real_to_generated": "diagnostic only; asymmetry indicates domain mismatch",
+    "native_classifier": "intentionally absent because it is part of V1's GAN loss"
+  }
+}
