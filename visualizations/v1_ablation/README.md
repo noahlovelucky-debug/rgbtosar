@@ -38,3 +38,13 @@ The milestone audit files show why native fake-class accuracy is not a valid
 selection metric: it is already near 100 percent at V1 epoch 10 while frozen
 geometry and generated-to-real azimuth transfer are still poor. The protocol
 and exact commands are in `code/V1_ABLATION_PROTOCOL.md`.
+
+The staged routing and classifier-discriminator experiments are also published:
+`G0_generator_only_vs_coupled_three_seed.png` and its long-confirmation
+counterpart test blocking SAR-side gradients from the RGB encoder;
+`G1_cross_view_half_vs_coupled_three_seed.png` tests a smaller cross-view
+coefficient; and `D1_real_class_head_vs_D0_three_seed.png` tests a zero-impact
+auxiliary 40-way class head trained on real SAR only. Their JSON files contain
+the exact TSTR deltas and selection decisions. D0 remains the V1-compatible
+control, and the D1 long confirmation is kept in the same directory when it
+finishes.
