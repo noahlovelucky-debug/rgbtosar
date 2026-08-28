@@ -97,6 +97,8 @@ def arguments() -> argparse.Namespace:
                         help="optional class auxiliary head on the existing PatchGAN; real_only uses only real SAR")
     parser.add_argument("--discriminator-class-weight", type=float, default=0.0,
                         help="weight for the real-only PatchGAN class CE; zero preserves V1 behavior")
+    parser.add_argument("--generator-discriminator-class-weight", type=float, default=0.0,
+                        help="optional G-step CE through the real-trained PatchGAN class head; default is disabled")
     parser.add_argument("--rgb-id-weight", type=float, default=10.0)
     parser.add_argument("--cross-view-weight", type=float, default=2.0)
     parser.add_argument("--sar-class-weight", type=float, default=12.0)
@@ -567,8 +569,15 @@ def main() -> None:
     discriminator = ContinuousROIDiscriminator(meta_dim=discriminator_meta_dim).to(device)
     if args.discriminator_class_weight < 0:
         raise ValueError("--discriminator-class-weight must be non-negative")
+    if args.generator_discriminator_class_weight < 0:
+        raise ValueError("--generator-discriminator-class-weight must be non-negative")
     if args.discriminator_class_mode == "disabled" and args.discriminator_class_weight:
         raise ValueError("a non-zero discriminator class weight requires --discriminator-class-mode real_only")
+    if args.discriminator_class_mode == "disabled" and args.generator_discriminator_class_weight:
+        raise ValueError("a non-zero generator discriminator class weight requires --discriminator-class-mode real_only")
+    if (args.generator_discriminator_class_weight
+            and not args.discriminator_class_weight):
+        raise ValueError("the generator class head requires a non-zero real-only discriminator class loss")
     encoder.apply(initialise); generator.apply(initialise); discriminator.apply(initialise)
     encoder.load_state_dict(parent["identity_encoder"])
     generator.load_state_dict(parent["generator"])
@@ -600,6 +609,7 @@ def main() -> None:
               *(f"contribution_{name}" for name in LOSS_NAMES), "loss_discriminator",
               "loss_discriminator_class", "loss_discriminator_wrong_azimuth",
               "discriminator_real_class_accuracy", "discriminator_fake_class_accuracy",
+              "loss_generator_discriminator_class", "generator_discriminator_class_accuracy",
               "rgb_identity_accuracy", "native_fake_accuracy", "cluster_cosine", "speckle_strength",
               "validation_samples", "validation_generated_identity",
               "validation_real_identity", "validation_generated_depression", "validation_real_depression",
@@ -676,7 +686,16 @@ def main() -> None:
 
             set_grad(discriminator, False); generator_optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                fake_score, fake_disc_features = discriminator(fake, discriminator_meta)
+                generator_discriminator_class_loss = real.new_zeros(())
+                generator_discriminator_class_accuracy = real.new_zeros(())
+                if args.generator_discriminator_class_weight:
+                    fake_score, fake_disc_features, fake_class_logits = discriminator(
+                        fake, discriminator_meta, return_class_logits=True)
+                    generator_discriminator_class_loss = cross_entropy(fake_class_logits, labels)
+                    generator_discriminator_class_accuracy = (
+                        (fake_class_logits.argmax(1) == labels).float().mean())
+                else:
+                    fake_score, fake_disc_features = discriminator(fake, discriminator_meta)
                 with torch.no_grad():
                     _, real_disc_features = discriminator(real, discriminator_meta)
                 sar_logits = sar_features = None
@@ -736,6 +755,9 @@ def main() -> None:
                 encoder_loss = contributions["rgb_identity"] + contributions["cross_view"]
                 generator_loss = sum(contributions[name] for name in LOSS_NAMES
                                      if name not in {"rgb_identity", "cross_view"})
+                generator_loss = (generator_loss
+                                  + args.generator_discriminator_class_weight
+                                  * generator_discriminator_class_loss)
                 total_loss = encoder_loss + generator_loss
                 if args.assert_gradient_routing and args.gradient_routing == "generator_only" and batch_index == 0:
                     encoder_parameters = tuple(encoder.parameters())
@@ -767,6 +789,10 @@ def main() -> None:
             totals["loss_discriminator_wrong_azimuth"] += float(wrong_azimuth_loss.detach())
             totals["discriminator_real_class_accuracy"] += float(discriminator_real_class_accuracy.detach())
             totals["discriminator_fake_class_accuracy"] += float(discriminator_fake_class_accuracy.detach())
+            totals["loss_generator_discriminator_class"] += float(
+                generator_discriminator_class_loss.detach())
+            totals["generator_discriminator_class_accuracy"] += float(
+                generator_discriminator_class_accuracy.detach())
             totals["rgb_identity_accuracy"] += float(.5 * (
                 (rgb_logits.argmax(1) == labels).float().mean() + (alternate_logits.argmax(1) == labels).float().mean()))
             if sar_logits is not None:
