@@ -293,16 +293,33 @@ class ROIDiscriminator(nn.Module):
 
 
 class ContinuousROIDiscriminator(ROIDiscriminator):
-    """Projection PatchGAN: judges whether ROI matches target angle/depression."""
+    """Projection PatchGAN with an optional real-SAR class auxiliary head.
 
-    def __init__(self, meta_dim: int = 12, base: int = 32) -> None:
+    The class head reads the same spatial feature tensor as the PatchGAN but
+    does not participate in the score map.  It is initialized to zero so an
+    old V1 checkpoint has exactly the same adversarial behavior when the
+    auxiliary loss is disabled.  The trainer can later enable a real-only
+    class loss without introducing a separate classifier backbone.
+    """
+
+    def __init__(self, meta_dim: int = 12, base: int = 32, classes: int = 40) -> None:
         super().__init__(base=base)
         self.condition = nn.Sequential(nn.Linear(meta_dim, base * 8), nn.SiLU(), nn.Linear(base * 8, base * 8))
+        self.classes = classes
+        self.classifier = nn.Linear(base * 8, classes)
+        # D0 must be numerically equivalent to the archived V1 discriminator.
+        nn.init.zeros_(self.classifier.weight)
+        nn.init.zeros_(self.classifier.bias)
 
-    def forward(self, roi: torch.Tensor, meta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, roi: torch.Tensor, meta: torch.Tensor,
+                return_class_logits: bool = False):
         features = self.features(roi)
         projection = (features * self.condition(meta)[:, :, None, None]).sum(1, keepdim=True)
-        return (self.score(features) + projection).flatten(1), features
+        score = (self.score(features) + projection).flatten(1)
+        if return_class_logits:
+            pooled = features.mean((2, 3))
+            return score, features, self.classifier(pooled)
+        return score, features
 
 
 def _sobel(image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

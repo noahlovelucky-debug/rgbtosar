@@ -214,3 +214,60 @@ The paired artifacts are kept under `runs/v1_ablation/`:
 `T1_statistics_5_to_0_three_seed_report.json`, and
 `L1_sar_class_12_to_1_2000_three_seed_report.json`. Their PNG counterparts are
 intended for visual inspection, but the JSON values are the selection record.
+
+## Next Controlled Change: Gradient Routing
+
+The native SAR classifier is frozen, but its `sar_class` and `cluster` losses
+still send gradients through the generated image into the RGB encoder. This
+allows the encoder to adapt to the teacher's shortcuts instead of preserving
+an RGB identity representation. G0 changes only that route:
+
+```bash
+PYTHON_BIN=/home/star/anaconda3/envs/tessera/bin/python ./run_v1_gradient_routing.sh
+```
+
+With `--gradient-routing generator_only`, the SAR-side losses receive detached
+RGB identity and pyramid features. The encoder still receives
+`rgb_identity + cross_view`; the generator still receives SAR, structure,
+physics, angle, adversarial, and feature-match gradients; the PatchGAN and all
+weights remain unchanged. `coupled` is the exact V1-compatible control.
+
+G0 must pass the same three-seed TSTR gates before any loss simplification.
+Only then may `--rgb-loss-mode joint_equivalent` group the two RGB terms. That
+mode is algebraically identical to `10 * rgb_identity + 2 * cross_view` at the
+default weights; it is a bookkeeping merge, not evidence that either term can
+be removed. A later `cross_view` coefficient sweep must be a separate test.
+
+The G0 2,000-step confirmation improved TSTR azimuth MAE in all three seeds
+(mean `-1.27` degrees), but one seed lost `2.81` percentage points of
+depression transfer. It therefore remains a diagnostic branch and is not the
+new default. The next accepted-parent test is a smaller `cross_view` weight,
+from `2` to `.5`, under the original coupled route.
+
+The `cross_view=0.5` three-seed screen also passed the inexpensive geometry
+gates but failed the transfer non-regression policy: one seed lost `2.19`
+percentage points of depression transfer, and mean TSTR azimuth MAE worsened
+by `0.26` degrees.  The archived `cross_view=0` result likewise reduced
+identity transfer by `0.52` points on average.  Keep the V1 value `2`.
+
+## Staged Classifier/Discriminator Fusion
+
+The first classifier-fusion step is deliberately additive.  `ContinuousROIDiscriminator`
+now owns a 40-way auxiliary class head over its existing PatchGAN feature
+pool.  The head is zeroed when migrating an archived V1 checkpoint, so
+`--discriminator-class-mode disabled --discriminator-class-weight 0` is a
+numerically equivalent D0 control.  D1 enables only
+`--discriminator-class-mode real_only --discriminator-class-weight .1`:
+the class CE is computed on real SAR and updates the discriminator, while fake
+SAR never supplies a class target and the generator receives no class-head
+gradient.  The existing frozen native `sar_class` and `cluster` terms remain
+unchanged in this stage.
+
+The three-seed D1 short screen passed all geometry gates and all transfer
+non-regression checks, but showed no consistent primary improvement (identity
+`-0.16` pp, depression `0.00` pp, azimuth MAE `+0.39` degrees on average).
+Therefore it is not promoted automatically; its matched 2,000-step
+confirmation is the next test.  A later generator class-adversarial term or a
+fake class (`K+1`) row is out of scope until this real-only head demonstrates
+stable transfer.  This ordering prevents the discriminator from learning a
+synthetic-image shortcut and keeps every change attributable to one branch.

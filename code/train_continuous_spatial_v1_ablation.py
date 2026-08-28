@@ -93,6 +93,10 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--identity-lr", type=float, default=1e-4)
     parser.add_argument("--discriminator-lr", type=float, default=5e-5)
     parser.add_argument("--discriminator-every", type=int, default=2)
+    parser.add_argument("--discriminator-class-mode", choices=("disabled", "real_only"), default="disabled",
+                        help="optional class auxiliary head on the existing PatchGAN; real_only uses only real SAR")
+    parser.add_argument("--discriminator-class-weight", type=float, default=0.0,
+                        help="weight for the real-only PatchGAN class CE; zero preserves V1 behavior")
     parser.add_argument("--rgb-id-weight", type=float, default=10.0)
     parser.add_argument("--cross-view-weight", type=float, default=2.0)
     parser.add_argument("--sar-class-weight", type=float, default=12.0)
@@ -119,6 +123,12 @@ def arguments() -> argparse.Namespace:
                         help="single-variable PatchGAN wrong-condition negative; V1 default is zero")
     parser.add_argument("--discriminator-condition", choices=("full", "target"), default="full",
                         help="V1's full 12D condition or only target azimuth/depression")
+    parser.add_argument("--gradient-routing", choices=("coupled", "generator_only"), default="coupled",
+                        help="coupled preserves V1; generator_only blocks SAR-side losses from RGB encoder")
+    parser.add_argument("--assert-gradient-routing", action="store_true",
+                        help="check the first generator backward for the generator_only route")
+    parser.add_argument("--rgb-loss-mode", choices=("separate", "joint_equivalent"), default="separate",
+                        help="keep V1 RGB terms separate or report their exact weighted sum as one term")
     parser.add_argument("--speckle-warmup-epochs", type=int, default=8)
     parser.add_argument("--speckle-ramp-epochs", type=int, default=5)
     parser.add_argument("--source-view-mode", choices=("nearest", "random", "mixed"), default="mixed")
@@ -172,6 +182,29 @@ def set_grad(model: nn.Module, enabled: bool) -> None:
         parameter.requires_grad_(enabled)
 
 
+def route_generator_inputs(identity: torch.Tensor, pyramid: tuple[torch.Tensor, ...],
+                           mode: str) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Select whether SAR-side losses may send gradients into the RGB encoder."""
+    if mode == "coupled":
+        return identity, pyramid
+    if mode == "generator_only":
+        return identity.detach(), tuple(value.detach() for value in pyramid)
+    raise ValueError(f"unsupported gradient routing mode: {mode}")
+
+
+def combine_rgb_losses(identity_loss: torch.Tensor, cross_view_loss: torch.Tensor,
+                       identity_weight: float, cross_view_weight: float,
+                       mode: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Optionally group RGB terms without changing their weighted objective."""
+    if mode == "separate":
+        return identity_loss, cross_view_loss
+    if mode == "joint_equivalent":
+        if identity_weight <= 0:
+            raise ValueError("joint_equivalent RGB loss requires a positive rgb identity weight")
+        return identity_loss + (cross_view_weight / identity_weight) * cross_view_loss, identity_loss.new_zeros(())
+    raise ValueError(f"unsupported RGB loss mode: {mode}")
+
+
 def discriminator_condition(condition: torch.Tensor, mode: str) -> torch.Tensor:
     """Keep only physical target attributes when testing the discriminator input."""
     if mode == "full":
@@ -185,17 +218,20 @@ def discriminator_condition(condition: torch.Tensor, mode: str) -> torch.Tensor:
 def load_parent_discriminator(discriminator: ContinuousROIDiscriminator,
                               parent_state: dict[str, torch.Tensor], mode: str) -> str:
     """Migrate V1's PatchGAN without randomising unrelated D weights."""
-    if mode == "full":
-        discriminator.load_state_dict(parent_state)
-        return "exact V1 state"
     target_state = discriminator.state_dict()
     for name, value in parent_state.items():
         if name == "condition.0.weight":
-            target_state[name] = value[:, :3].clone()
+            target_state[name] = (value.clone() if mode == "full" else value[:, :3].clone())
         elif name in target_state and target_state[name].shape == value.shape:
             target_state[name] = value
+    # The archived V1 D has no auxiliary classifier.  Keep the new head at
+    # zero so adding it is an exact D0 no-op until its real-only loss is enabled.
+    if not any(name.startswith("classifier.") for name in parent_state):
+        target_state["classifier.weight"] = torch.zeros_like(target_state["classifier.weight"])
+        target_state["classifier.bias"] = torch.zeros_like(target_state["classifier.bias"])
     discriminator.load_state_dict(target_state)
-    return "V1 state; condition.0.weight restricted to target azimuth/depression columns"
+    return ("exact V1 state + zero auxiliary class head" if mode == "full" else
+            "V1 state; condition.0.weight restricted to target azimuth/depression columns")
 
 
 class PrototypeROIDataset(Dataset):
@@ -529,6 +565,10 @@ def main() -> None:
     generator = SpatialROIGenerator(meta_dim=12).to(device)
     discriminator_meta_dim = 12 if args.discriminator_condition == "full" else 3
     discriminator = ContinuousROIDiscriminator(meta_dim=discriminator_meta_dim).to(device)
+    if args.discriminator_class_weight < 0:
+        raise ValueError("--discriminator-class-weight must be non-negative")
+    if args.discriminator_class_mode == "disabled" and args.discriminator_class_weight:
+        raise ValueError("a non-zero discriminator class weight requires --discriminator-class-mode real_only")
     encoder.apply(initialise); generator.apply(initialise); discriminator.apply(initialise)
     encoder.load_state_dict(parent["identity_encoder"])
     generator.load_state_dict(parent["generator"])
@@ -555,10 +595,13 @@ def main() -> None:
                    "discriminator_migration": discriminator_migration,
                    "policy": "single-variable V1 ablation; frozen geometry validator only"})
     (args.output / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    header = ("run_epoch", "epoch", "loss_total", *(f"loss_{name}" for name in LOSS_NAMES),
+    header = ("run_epoch", "epoch", "loss_total", "loss_encoder", "loss_generator",
+              *(f"loss_{name}" for name in LOSS_NAMES),
               *(f"contribution_{name}" for name in LOSS_NAMES), "loss_discriminator",
-              "loss_discriminator_wrong_azimuth", "rgb_identity_accuracy", "native_fake_accuracy",
-              "cluster_cosine", "speckle_strength", "validation_samples", "validation_generated_identity",
+              "loss_discriminator_class", "loss_discriminator_wrong_azimuth",
+              "discriminator_real_class_accuracy", "discriminator_fake_class_accuracy",
+              "rgb_identity_accuracy", "native_fake_accuracy", "cluster_cosine", "speckle_strength",
+              "validation_samples", "validation_generated_identity",
               "validation_real_identity", "validation_generated_depression", "validation_real_depression",
               "validation_generated_azimuth_mae", "validation_real_azimuth_mae", "validation_pair_30_error",
               "validation_feature_cosine", "validation_aligned_lowpass_l1", "validation_response_lowpass_l1_30")
@@ -589,15 +632,35 @@ def main() -> None:
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 identity, rgb_logits, pyramid = encoder(rgb, return_pyramid=True)
                 alternate_identity, alternate_logits = encoder(rgb_alt)
-                clean = generator(identity, condition, pyramid, apply_speckle=False)
+                # The coupled route reproduces V1.  The generator-only route
+                # prevents SAR teacher/structure/physics/D gradients from
+                # changing the RGB identity representation or its pyramid.
+                generator_identity, generator_pyramid = route_generator_inputs(
+                    identity, pyramid, args.gradient_routing)
+                clean = generator(generator_identity, condition, generator_pyramid, apply_speckle=False)
                 fake = generator.apply_speckle(clean, speckle)
 
             discriminator_optimizer.zero_grad(set_to_none=True)
             discriminator_meta = discriminator_condition(condition, args.discriminator_condition)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                real_score, _ = discriminator(real, discriminator_meta)
-                fake_score, _ = discriminator(fake.detach(), discriminator_meta)
-                discriminator_loss = F.relu(1.0 - real_score).mean() + F.relu(1.0 + fake_score).mean()
+                discriminator_class_loss = real.new_zeros(())
+                discriminator_real_class_accuracy = real.new_zeros(())
+                discriminator_fake_class_accuracy = real.new_zeros(())
+                if args.discriminator_class_mode == "real_only":
+                    real_score, _, real_class_logits = discriminator(
+                        real, discriminator_meta, return_class_logits=True)
+                    fake_score, _, fake_class_logits = discriminator(
+                        fake.detach(), discriminator_meta, return_class_logits=True)
+                    discriminator_class_loss = cross_entropy(real_class_logits, labels)
+                    discriminator_loss = (F.relu(1.0 - real_score).mean()
+                                          + F.relu(1.0 + fake_score).mean()
+                                          + args.discriminator_class_weight * discriminator_class_loss)
+                    discriminator_real_class_accuracy = (real_class_logits.argmax(1) == labels).float().mean()
+                    discriminator_fake_class_accuracy = (fake_class_logits.argmax(1) == labels).float().mean()
+                else:
+                    real_score, _ = discriminator(real, discriminator_meta)
+                    fake_score, _ = discriminator(fake.detach(), discriminator_meta)
+                    discriminator_loss = F.relu(1.0 - real_score).mean() + F.relu(1.0 + fake_score).mean()
                 wrong_azimuth_loss = real.new_zeros(())
                 if args.wrong_azimuth_discriminator_weight:
                     wrong_condition = rotate_target_azimuth(condition, random.choice((-90., -60., -30., 30., 60., 90.)))
@@ -622,16 +685,24 @@ def main() -> None:
                     sar_logits, sar_features, fake_sar_pyramid = judge((fake + 1.0) * .5, return_pyramid=True)
                 if args.angle_loss_mode == "first_order":
                     angle_loss = F.l1_loss(F.avg_pool2d(clean, 4), F.avg_pool2d(
-                        generator(identity, rotate_target_azimuth(condition), pyramid, apply_speckle=False), 4))
+                        generator(generator_identity, rotate_target_azimuth(condition), generator_pyramid,
+                                  apply_speckle=False), 4))
                 else:
-                    left = generator(identity, rotate_target_azimuth(condition, -5.0), pyramid,
+                    left = generator(generator_identity, rotate_target_azimuth(condition, -5.0), generator_pyramid,
                                      apply_speckle=False)
-                    right = generator(identity, rotate_target_azimuth(condition, 5.0), pyramid,
+                    right = generator(generator_identity, rotate_target_azimuth(condition, 5.0), generator_pyramid,
                                       apply_speckle=False)
                     angle_loss = angle_curvature_loss(left, clean, right)
+                rgb_identity_loss = .5 * (cross_entropy(rgb_logits, labels)
+                                          + cross_entropy(alternate_logits, labels))
+                cross_view_loss = 1.0 - (F.normalize(identity, dim=1)
+                                         * F.normalize(alternate_identity, dim=1)).sum(1).mean()
+                rgb_identity_loss, cross_view_loss = combine_rgb_losses(
+                    rgb_identity_loss, cross_view_loss, args.rgb_id_weight,
+                    args.cross_view_weight, args.rgb_loss_mode)
                 raw_losses = {
-                    "rgb_identity": .5 * (cross_entropy(rgb_logits, labels) + cross_entropy(alternate_logits, labels)),
-                    "cross_view": 1.0 - (F.normalize(identity, dim=1) * F.normalize(alternate_identity, dim=1)).sum(1).mean(),
+                    "rgb_identity": rgb_identity_loss,
+                    "cross_view": cross_view_loss,
                     "sar_class": cross_entropy(sar_logits, labels) if args.sar_class_weight else real.new_zeros(()),
                     "cluster": (1.0 - (F.normalize(sar_features, dim=1)
                                 * prototypes[labels, depression]).sum(1).mean())
@@ -662,7 +733,23 @@ def main() -> None:
                     raw_losses["perceptual"] = real.new_zeros(())
                 contributions = {
                     name: raw_losses[name] * getattr(args, WEIGHT_ARGUMENTS[name]) for name in LOSS_NAMES}
-                total_loss = sum(contributions.values())
+                encoder_loss = contributions["rgb_identity"] + contributions["cross_view"]
+                generator_loss = sum(contributions[name] for name in LOSS_NAMES
+                                     if name not in {"rgb_identity", "cross_view"})
+                total_loss = encoder_loss + generator_loss
+                if args.assert_gradient_routing and args.gradient_routing == "generator_only" and batch_index == 0:
+                    encoder_parameters = tuple(encoder.parameters())
+                    generator_parameters = tuple(generator.parameters())
+                    sar_to_encoder = torch.autograd.grad(
+                        generator_loss, encoder_parameters, retain_graph=True, allow_unused=True)
+                    rgb_to_generator = torch.autograd.grad(
+                        encoder_loss, generator_parameters, retain_graph=True, allow_unused=True)
+                    sar_norm = sum(float(value.detach().abs().max()) for value in sar_to_encoder if value is not None)
+                    rgb_norm = sum(float(value.detach().abs().max()) for value in rgb_to_generator if value is not None)
+                    if sar_norm > 1e-8 or rgb_norm > 1e-8:
+                        raise RuntimeError(
+                            f"generator_only gradient routing failed: sar_to_encoder={sar_norm}, "
+                            f"rgb_to_generator={rgb_norm}")
             generator_scaler.scale(total_loss).backward()
             generator_scaler.unscale_(generator_optimizer)
             torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(generator.parameters()), 5.)
@@ -670,11 +757,16 @@ def main() -> None:
             set_grad(discriminator, True)
 
             totals["loss_total"] += float(total_loss.detach())
+            totals["loss_encoder"] += float(encoder_loss.detach())
+            totals["loss_generator"] += float(generator_loss.detach())
             for name in LOSS_NAMES:
                 totals[f"loss_{name}"] += float(raw_losses[name].detach())
                 totals[f"contribution_{name}"] += float(contributions[name].detach())
             totals["loss_discriminator"] += float(discriminator_loss.detach())
+            totals["loss_discriminator_class"] += float(discriminator_class_loss.detach())
             totals["loss_discriminator_wrong_azimuth"] += float(wrong_azimuth_loss.detach())
+            totals["discriminator_real_class_accuracy"] += float(discriminator_real_class_accuracy.detach())
+            totals["discriminator_fake_class_accuracy"] += float(discriminator_fake_class_accuracy.detach())
             totals["rgb_identity_accuracy"] += float(.5 * (
                 (rgb_logits.argmax(1) == labels).float().mean() + (alternate_logits.argmax(1) == labels).float().mean()))
             if sar_logits is not None:
