@@ -48,3 +48,9 @@ auxiliary 40-way class head trained on real SAR only. Their JSON files contain
 the exact TSTR deltas and selection decisions. D0 remains the V1-compatible
 control, and the D1 long confirmation is kept in the same directory when it
 finishes.
+
+The D1 long-confirmation plot and JSON are named
+`D1_real_class_head_vs_D0_long_three_seed.png` and
+`D1_real_class_head_vs_D0_long_three_seed_report.json`. It passes
+non-regression but is not promoted because no primary metric improves in all
+three seeds; the real-only head remains an optional diagnostic.

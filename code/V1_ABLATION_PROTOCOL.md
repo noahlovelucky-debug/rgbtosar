@@ -271,3 +271,14 @@ confirmation is the next test.  A later generator class-adversarial term or a
 fake class (`K+1`) row is out of scope until this real-only head demonstrates
 stable transfer.  This ordering prevents the discriminator from learning a
 synthetic-image shortcut and keeps every change attributable to one branch.
+
+The D1 2,000-step confirmation passed the same gates and transfer
+non-regression policy in all three seeds, but still did not meet the promotion
+criterion of one primary metric improving in every seed.  Its mean deltas were
+identity `+0.052` pp, depression `+0.885` pp, and azimuth MAE `+0.473` degrees
+(worse).  The real-only class head remained near `4--5%` accuracy (40 classes,
+random is `2.5%`).  This is evidence that the original PatchGAN feature map is
+not a useful vehicle classifier after a weak auxiliary CE; keep D0/V1 as the
+default and treat D1 as a diagnostic branch.  The next classifier experiment
+must improve the shared feature readout itself before any class loss is sent
+through the generator.
