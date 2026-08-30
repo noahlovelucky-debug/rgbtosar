@@ -13,6 +13,7 @@ import csv
 import copy
 import hashlib
 import json
+import os
 import random
 from collections import defaultdict
 from contextlib import nullcontext
@@ -21,9 +22,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from dual_component_sar_gan import LargeRGBIdentityEncoder
@@ -71,6 +74,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--geometry-weight", type=float, default=.30)
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=-1,
+                        help="torchrun local rank; normally supplied through the environment")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--limit-train-batches", type=int, default=0)
@@ -84,11 +89,52 @@ def autocast_context(device: torch.device, enabled: bool):
 
 
 def make_loader(dataset: JointROIDataset, batch_size: int, workers: int,
-                shuffle: bool, device: torch.device) -> DataLoader:
+                shuffle: bool, device: torch.device,
+                sampler: DistributedSampler | None = None) -> DataLoader:
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers,
+        dataset, batch_size=batch_size, shuffle=shuffle if sampler is None else False,
+        sampler=sampler, num_workers=workers,
         pin_memory=device.type == "cuda", persistent_workers=workers > 0,
         drop_last=shuffle)
+
+
+def setup_distributed(args: argparse.Namespace) -> tuple[bool, int, int, int, torch.device]:
+    """Initialize single-node DDP when launched by torchrun.
+
+    A normal ``python`` invocation remains single-process.  In DDP mode the
+    launcher-provided rank is authoritative, so ``--device`` is only used by
+    the non-distributed path.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(args.local_rank)))
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP requires CUDA; torchrun launched multiple ranks")
+        if local_rank < 0:
+            raise RuntimeError("torchrun did not provide LOCAL_RANK")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl", init_method="env://",
+            device_id=torch.device("cuda", local_rank))
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(args.device)
+    return distributed, world_size, rank, local_rank, device
+
+
+def unwrap(module: nn.Module) -> nn.Module:
+    """Return the underlying module for DDP-safe checkpoint serialization."""
+    return module.module if isinstance(module, DDP) else module
+
+
+def all_reduce_stats(values: list[float], device: torch.device,
+                     distributed: bool) -> list[float]:
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    if distributed:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.cpu().tolist()
 
 
 def split_records(records: list[tuple], root: Path, manifest: Path,
@@ -186,9 +232,9 @@ def checkpoint_state(epoch: int, encoder: nn.Module, generator: nn.Module,
         "epoch": epoch,
         "classes": list(SOC40_CLASSES),
         "condition_dim": 12,
-        "identity_encoder": encoder.state_dict(),
-        "generator": generator.state_dict(),
-        "discriminator": discriminator.state_dict(),
+        "identity_encoder": unwrap(encoder).state_dict(),
+        "generator": unwrap(generator).state_dict(),
+        "discriminator": unwrap(discriminator).state_dict(),
         "ema_identity_encoder": ema_encoder.state_dict(),
         "ema_generator": ema_generator.state_dict(),
         "generator_optimizer": generator_optimizer.state_dict(),
@@ -204,11 +250,23 @@ def main() -> None:
     args = arguments()
     if args.epochs <= 0 or args.batch_size <= 0 or args.epoch_size <= 0:
         raise ValueError("epochs, batch-size and epoch-size must be positive")
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    args.output.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
+    distributed, world_size, rank, local_rank, device = setup_distributed(args)
+    is_main = rank == 0
+    if distributed:
+        # Keep model initialization identical on every rank.  Rank-specific
+        # RNG streams are installed after DDP broadcasts the parameters.
+        seed = args.seed
+    else:
+        seed = args.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+    if is_main:
+        args.output.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
     use_amp = device.type == "cuda" and not args.no_amp
 
     train_data = JointROIDataset(
@@ -216,19 +274,39 @@ def main() -> None:
         epoch_size=0, band=args.band, polarization=args.polarization,
         depression=args.depression, augment_rgb=True, source_view_mode="random")
     manifest = args.output / f"split_manifest__{args.band}_{args.polarization}_{args.depression}.json"
-    train_keys, validation_keys = split_records(
-        train_data.records, args.sar_train_root, manifest,
-        args.validation_fraction, args.seed,
-        {"band": args.band, "polarization": args.polarization,
-         "depression": args.depression})
+    filters = {"band": args.band, "polarization": args.polarization,
+               "depression": args.depression}
+    # Only rank 0 creates a new manifest.  Other ranks wait for the file and
+    # then read the exact same split, avoiding concurrent writes on the mount.
+    if is_main:
+        train_keys, validation_keys = split_records(
+            train_data.records, args.sar_train_root, manifest,
+            args.validation_fraction, args.seed, filters)
+    if distributed:
+        dist.barrier()
+    if not is_main:
+        train_keys, validation_keys = split_records(
+            train_data.records, args.sar_train_root, manifest,
+            args.validation_fraction, args.seed, filters)
+    if distributed:
+        dist.barrier()
     configure_records(train_data, train_keys, args.sar_train_root, args.epoch_size)
     validation_data = JointROIDataset(
         args.rgb_root, args.sar_train_root, rgb_size=128, roi_size=64,
         epoch_size=0, band=args.band, polarization=args.polarization,
         depression=args.depression, augment_rgb=False, source_view_mode="random")
     configure_records(validation_data, validation_keys, args.sar_train_root)
-    train_loader = make_loader(train_data, args.batch_size, args.workers, True, device)
-    validation_loader = make_loader(validation_data, args.batch_size, args.workers, False, device)
+    train_sampler = (DistributedSampler(
+        train_data, num_replicas=world_size, rank=rank, shuffle=True,
+        seed=args.seed, drop_last=True) if distributed else None)
+    validation_sampler = (DistributedSampler(
+        validation_data, num_replicas=world_size, rank=rank, shuffle=False,
+        seed=args.seed, drop_last=False) if distributed else None)
+    train_loader = make_loader(
+        train_data, args.batch_size, args.workers, True, device, train_sampler)
+    validation_loader = make_loader(
+        validation_data, args.batch_size, args.workers, False, device,
+        validation_sampler)
 
     teacher = load_teacher(args.native_classifier_checkpoint, device)
     encoder = LargeRGBIdentityEncoder(len(SOC40_CLASSES)).to(device)
@@ -262,6 +340,28 @@ def main() -> None:
         discriminator_optimizer.load_state_dict(saved["discriminator_optimizer"])
         start_epoch = int(saved["epoch"]) + 1
 
+    if distributed:
+        # Optimizers are restored against the plain modules first.  Wrapping
+        # afterwards keeps old single-GPU checkpoints compatible and avoids
+        # the ``module.`` prefix in the saved state.
+        ddp_kwargs = {
+            "device_ids": [local_rank],
+            "output_device": local_rank,
+            "broadcast_buffers": True,
+            "find_unused_parameters": False,
+            "gradient_as_bucket_view": True,
+        }
+        encoder = DDP(encoder, **ddp_kwargs)
+        generator = DDP(generator, **ddp_kwargs)
+        discriminator = DDP(discriminator, **ddp_kwargs)
+        # The model was broadcast by DDP.  Use independent streams for data
+        # augmentation and per-rank spatial noise after that broadcast.
+        rank_seed = args.seed + 100003 * rank
+        random.seed(rank_seed)
+        np.random.seed(rank_seed)
+        torch.manual_seed(rank_seed)
+        torch.cuda.manual_seed_all(rank_seed)
+
     counts = {
         "rgb_identity_encoder": parameter_count(encoder),
         "hifc_generator": parameter_count(generator),
@@ -272,6 +372,10 @@ def main() -> None:
         **{key: str(value) if isinstance(value, Path) else value
            for key, value in vars(args).items()},
         "architecture": HIFC_ARCHITECTURE,
+        "distributed": distributed,
+        "world_size": world_size,
+        "per_rank_batch_size": args.batch_size,
+        "effective_global_batch_size": args.batch_size * world_size,
         "parameters": counts,
         "train_records": len(train_data.records),
         "validation_records": len(validation_data.records),
@@ -289,11 +393,13 @@ def main() -> None:
         "pixel_alignment_used": False,
         "comparison_to_v1": "new standalone HiFC-inspired path; V1 untouched",
     }
-    (args.output / "config.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    print({"parameters": counts, "train": train_data.summary(),
-           "validation": validation_data.summary(),
-           "condition": config["condition_layout"]}, flush=True)
+    if is_main:
+        (args.output / "config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        print({"parameters": counts, "train": train_data.summary(),
+               "validation": validation_data.summary(),
+               "condition": config["condition_layout"],
+               "distributed": distributed, "world_size": world_size}, flush=True)
 
     columns = (
         "epoch", "generator", "adversarial", "rgb_identity", "ltc", "sfm",
@@ -303,16 +409,20 @@ def main() -> None:
         "native_azimuth_accuracy", "validation_ltc", "validation_sfm",
         "validation_geometry", "validation_native_class_accuracy")
     history = args.output / "history.csv"
-    if start_epoch == 1:
+    if is_main and (start_epoch == 1 or not history.is_file()):
         with history.open("w", newline="", encoding="utf-8") as handle:
             csv.writer(handle).writerow(columns)
 
     for epoch in range(start_epoch, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         encoder.train(); generator.train(); discriminator.train()
         set_grad(discriminator, True)
         totals = defaultdict(float)
         steps = 0
-        progress = tqdm(train_loader, desc=f"HiFC unpaired {epoch}/{args.epochs}")
+        progress = tqdm(
+            train_loader, desc=f"HiFC unpaired {epoch}/{args.epochs}",
+            disable=not is_main)
         for batch_index, batch in enumerate(progress):
             rgb = batch["rgb"].to(device, non_blocking=True)
             rgb_alt = batch["rgb_alt"].to(device, non_blocking=True)
@@ -482,25 +592,53 @@ def main() -> None:
                 if (args.limit_validation_batches
                         and batch_index + 1 >= args.limit_validation_batches):
                     break
-        validation = {name: value / max(val_count, 1)
-                      for name, value in val_totals.items()}
-        averages = {name: value / max(steps, 1) for name, value in totals.items()}
+        metric_names = (
+            "generator", "adversarial", "rgb_identity", "ltc", "sfm",
+            "geometry", "discriminator", "disc_wrong_class",
+            "disc_wrong_condition", "r1", "rgb_accuracy",
+            "native_class_accuracy", "native_band_accuracy",
+            "native_polarization_accuracy", "native_depression_accuracy",
+            "native_azimuth_accuracy")
+        reduced_totals = all_reduce_stats(
+            [totals.get(name, 0.0) for name in metric_names] + [float(steps)],
+            device, distributed)
+        total_steps = max(reduced_totals[-1], 1.0)
+        averages = {
+            name: reduced_totals[index] / total_steps
+            for index, name in enumerate(metric_names)}
+        validation_names = ("ltc", "sfm", "geometry", "native_class_accuracy")
+        reduced_validation = all_reduce_stats(
+            [val_totals.get(name, 0.0) for name in validation_names]
+            + [float(val_count)], device, distributed)
+        total_val_count = max(reduced_validation[-1], 1.0)
+        validation = {
+            name: reduced_validation[index] / total_val_count
+            for index, name in enumerate(validation_names)}
         row = (epoch, *[averages.get(name, float("nan")) for name in columns[1:17]],
                validation.get("ltc", float("nan")),
                validation.get("sfm", float("nan")),
                validation.get("geometry", float("nan")),
                validation.get("native_class_accuracy", float("nan")))
-        with history.open("a", newline="", encoding="utf-8") as handle:
-            csv.writer(handle).writerow(row)
-        state = checkpoint_state(
-            epoch, encoder, generator, discriminator, ema_encoder, ema_generator,
-            generator_optimizer, discriminator_optimizer, validation, args)
-        torch.save(state, args.output / "latest.pt")
-        if epoch % 10 == 0 or epoch == args.epochs:
-            torch.save(state, args.output / f"epoch_{epoch:03d}.pt")
-        if preview is not None and (epoch == 1 or epoch % 5 == 0 or epoch == args.epochs):
-            save_preview(args.output / f"validation_{epoch:03d}.png", *preview)
-        print(dict(zip(columns, row)), flush=True)
+        if is_main:
+            with history.open("a", newline="", encoding="utf-8") as handle:
+                csv.writer(handle).writerow(row)
+            state = checkpoint_state(
+                epoch, encoder, generator, discriminator, ema_encoder, ema_generator,
+                generator_optimizer, discriminator_optimizer, validation, args)
+            torch.save(state, args.output / "latest.pt")
+            if epoch % 10 == 0 or epoch == args.epochs:
+                torch.save(state, args.output / f"epoch_{epoch:03d}.pt")
+            if preview is not None and (epoch == 1 or epoch % 5 == 0
+                                        or epoch == args.epochs):
+                save_preview(args.output / f"validation_{epoch:03d}.png", *preview)
+            print(dict(zip(columns, row)), flush=True)
+        if distributed:
+            # Do not let a fast rank enter the next epoch while rank 0 is
+            # still serializing a multi-hundred-MiB checkpoint.
+            dist.barrier()
+
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,9 @@ SAR 只按车型建立弱语义关系，不做同坐标像素重建；目标 SAR
 作为条件输入。完整架构、loss、梯度路径和运行命令见
 [`HIFC_UNPAIRED_ADAPTATION_ZH.md`](HIFC_UNPAIRED_ADAPTATION_ZH.md)。
 
+本次正式 8 卡 DDP 续训的预览图、loss 曲线和指标快照见
+[`visualizations/hifc_unpaired_ddp`](visualizations/hifc_unpaired_ddp/README.md)。
+
 ```bash
 DATA_ROOT=/data/newdata/A25_T37_down_大图/A02 \
 DEVICE=cuda:0 OUTPUT=runs/hifc_unpaired_all_conditions \
