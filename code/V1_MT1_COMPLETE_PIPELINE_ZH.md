@@ -126,6 +126,18 @@ c = [ sin(az_target), cos(az_target), depression/60,
 
 但当前 V1 的 structure 和 physics 内部仍会对真实 SAR 做一个小范围的离散平移选择，再比较像素/散射项。这是允许小位移的弱对齐，不是固定坐标的严格配准；它在当前 MT1 中仍然存在。
 
+### 2.5 本机读取核验
+
+本次在训练机上对上述目录做了只读检查：RGB 目录存在 40 个车型子目录；SAR 目录存在 12,157 个 `X_HH_*.tif`，且每个都有对应 XML。随机样本可正常打开（RGB 为 RGBA、原始尺寸 4000x3000；SAR 为灰度 L、示例尺寸 54x54）。当前 MT1 的固定 split 使用其中全部 12,157 条 X/HH 记录：
+
+~~~text
+train split:       10,190 records
+validation split:   1,967 records
+visual proxy:         640 records
+~~~
+
+active trainer 的 `pre_cropped=True` 会把这些已裁剪 SAR 直接缩放到 64x64；不会再按 XML bbox 对 TIFF 做第二次裁剪。因此数据入口、XML 标签、PNG/TIFF 解码和 64x64 tensor 化均已验证可用。
+
 ## 3. 当前网络架构
 
 ### 3.1 RGBIdentityEncoder
