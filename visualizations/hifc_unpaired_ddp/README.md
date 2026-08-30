@@ -17,6 +17,8 @@ epoch 16 完成后，从同一个 `latest.pt` 继续使用 8 卡 DDP；原单卡
 
 ![loss and metrics](loss_and_metrics.png)
 
+![epoch 50 preview](validation_050.png)
+
 ![epoch 45 preview](validation_045.png)
 
 ![epoch 40 preview](validation_040.png)
@@ -32,14 +34,15 @@ epoch 16 完成后，从同一个 `latest.pt` 继续使用 8 卡 DDP；原单卡
 |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | 16 | single GPU | 2.0637 | 1.9718 | 0.3472 | 0.3054 | 98.68% | 94.22% | 89.78% | 99.76% |
 | 46 | 8-GPU DDP | 1.8955 | 1.9690 | 0.2957 | 0.2497 | 99.89% | 98.20% | 94.03% | 99.92% |
+| 50 | 8-GPU DDP | 1.8933 | 1.9657 | 0.2960 | 0.2495 | 99.91% | 98.06% | 94.05% | 99.97% |
 
-验证损失从 epoch16 到 epoch46：SFM `0.3193 -> 0.2949`，geometry
-`0.2645 -> 0.2375`。RGB identity 保持在约 `0.24`，判别器总损失保持在约 `1.97`。
+验证损失从 epoch16 到 epoch50：SFM `0.3193 -> 0.2943`，geometry
+`0.2645 -> 0.2389`。RGB identity 保持在约 `0.24`，判别器总损失保持在约 `1.97`。
 
 ## 文件
 
 - `validation_005_single_gpu.png`、`validation_010_single_gpu.png`、`validation_015_single_gpu.png`：单卡阶段预览
-- `validation_020.png`、`validation_030.png`、`validation_040.png`、`validation_045.png`：DDP 阶段预览
+- `validation_020.png`、`validation_030.png`、`validation_040.png`、`validation_045.png`、`validation_050.png`：DDP 阶段预览
 - `loss_and_metrics.png`：loss 和 native teacher 诊断曲线，虚线处为 DDP 切换
 - `history_single_gpu_epoch001_016.csv`、`history_ddp_epoch017_current.csv`：原始训练记录
 - `metrics_snapshot.json`：可复核的指标快照
