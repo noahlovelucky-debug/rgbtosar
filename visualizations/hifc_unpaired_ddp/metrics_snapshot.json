@@ -1,5 +1,5 @@
 {
-  "snapshot_completed_epoch": 50,
+  "snapshot_completed_epoch": 51,
   "ddp_started_after_single_gpu_epoch": 16,
   "world_size": 8,
   "per_rank_batch_size": 8,
@@ -165,6 +165,29 @@
       "validation_ltc": 0.0001297367777498753,
       "validation_sfm": 0.29431266380224547,
       "validation_geometry": 0.23891854575873822,
+      "validation_native_class_accuracy": 0.999706342991386
+    },
+    "51": {
+      "epoch": 51,
+      "generator": 1.8945649916728338,
+      "adversarial": 0.9885668622851371,
+      "rgb_identity": 0.23938747487962245,
+      "ltc": 0.00012115668229671428,
+      "sfm": 0.2955608378400405,
+      "geometry": 0.25082220857590437,
+      "discriminator": 1.966730289697647,
+      "disc_wrong_class": 0.10318780505408844,
+      "disc_wrong_condition": 0.12981647212058306,
+      "r1": 0.007869997347394625,
+      "rgb_accuracy": 1.0,
+      "native_class_accuracy": 0.999125,
+      "native_band_accuracy": 0.9920833333333333,
+      "native_polarization_accuracy": 0.7052083333333333,
+      "native_depression_accuracy": 0.981125,
+      "native_azimuth_accuracy": 0.9419166666666666,
+      "validation_ltc": 0.00012838619022926339,
+      "validation_sfm": 0.29438699567770715,
+      "validation_geometry": 0.23872419333372763,
       "validation_native_class_accuracy": 0.999706342991386
     }
   }
