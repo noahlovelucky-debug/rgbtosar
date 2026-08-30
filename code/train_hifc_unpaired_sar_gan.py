@@ -60,6 +60,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--generator-lr", type=float, default=1.5e-4)
     parser.add_argument("--identity-lr", type=float, default=1e-4)
     parser.add_argument("--discriminator-lr", type=float, default=1e-4)
+    parser.add_argument("--adversarial-weight", type=float, default=1.0)
     parser.add_argument("--adversarial-warmup-epochs", type=int, default=1)
     parser.add_argument("--r1-weight", type=float, default=.25)
     parser.add_argument("--r1-every", type=int, default=16)
@@ -386,7 +387,7 @@ def main() -> None:
                 geometry, geometry_terms = geometry_auxiliary_loss(
                     teacher, fake.float(), meta.float(), depression, azimuth)
                 adv_scale = 0.0 if epoch <= args.adversarial_warmup_epochs else 1.0
-                g_loss = (adv_scale * adversarial
+                g_loss = (adv_scale * args.adversarial_weight * adversarial
                           + args.rgb_identity_weight * rgb_loss
                           + args.ltc_weight * ltc
                           + args.sfm_weight * sfm
