@@ -14,6 +14,7 @@ from bbox_data import image_tensor
 from dual_component_sar_gan import LargeRGBIdentityEncoder
 from hifc_unpaired_sar_gan import (
     HIFC_ARCHITECTURE, HIFCUnpairedGenerator, condition_from_batch)
+from joint_data import source_rgb_angle
 from rgb2sar.data import rgba_to_rgb
 from saratrx import SOC40_CLASSES
 
@@ -36,10 +37,10 @@ def find_rgb(root: Path, class_name: str, angle: int) -> Path:
     paths = [path for path in (root / class_name).glob("*.png") if path.stem.isdigit()]
     if not paths:
         raise RuntimeError(f"no RGB views found under {root / class_name}")
-    # The current dataset convention is 1.png=0°, ..., 12.png=330°.
-    wanted = ((angle % 360) // 30) + 1
-    return min(paths, key=lambda path: abs(int(path.stem) - wanted)
-               if int(path.stem) <= 12 else 999)
+    has_degree_names = any(path.stem == "0" for path in paths)
+    return min(paths, key=lambda path: min(
+        (angle - source_rgb_angle(path, has_degree_names)) % 360,
+        (source_rgb_angle(path, has_degree_names) - angle) % 360))
 
 
 def condition(azimuth: int, depression: int, band: str, pol: str) -> torch.Tensor:
