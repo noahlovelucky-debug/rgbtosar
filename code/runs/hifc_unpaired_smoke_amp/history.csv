@@ -1,0 +1,2 @@
+epoch,generator,adversarial,rgb_identity,ltc,sfm,geometry,discriminator,disc_wrong_class,disc_wrong_condition,r1,rgb_accuracy,native_class_accuracy,native_band_accuracy,native_polarization_accuracy,native_depression_accuracy,native_azimuth_accuracy,validation_ltc,validation_sfm,validation_geometry,validation_native_class_accuracy
+1,7.032004356384277,0.22731071710586548,3.6689999103546143,0.010023387148976326,1.0478596687316895,4.157461166381836,4.165627956390381,0.0,0.0,0.16777722537517548,0.0,0.0,0.0,0.0,0.0,0.0,0.012586694210767746,1.0573679208755493,5.352601051330566,0.0
