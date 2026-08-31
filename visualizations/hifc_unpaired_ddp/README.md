@@ -1,5 +1,8 @@
 # HiFC Unpaired DDP 训练可视化
 
+> 这是 epoch 51 的中途快照。最终 epoch 120 曲线、流程图和独立 TSTR 请看
+> [`visualizations/hifc_unpaired_final`](../hifc_unpaired_final/README.md)。
+
 本目录记录 `hifc_unpaired_conditioned_v1` 的正式多卡续训。原单卡训练在
 epoch 16 完成后，从同一个 `latest.pt` 继续使用 8 卡 DDP；原单卡输出没有被覆盖。
 

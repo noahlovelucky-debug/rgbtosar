@@ -1,5 +1,9 @@
 # HiFC 风格无像素配对 RGB→SAR 实验
 
+> 本文是实现说明和早期实验记录。最终 120 epoch 的完整工作流、三 seed TSTR 结果和
+> 发布图表请先看仓库根目录的
+> [`HIFC_UNPAIRED_FINAL_WORKFLOW_ZH.md`](../HIFC_UNPAIRED_FINAL_WORKFLOW_ZH.md)。
+
 ## 1. 结论与边界
 
 HiFC-GAN 的论文公开页面在 [AAAI](https://ojs.aaai.org/index.php/AAAI/article/view/38342)。当前没有找到作者公开的官方代码仓库，因此本项目没有伪装成“下载并原样复现”，而是把论文中最适合本数据的两条主线重新实现：
@@ -324,4 +328,3 @@ preview:    runs/hifc_unpaired_smoke/validation_001.png
 2. 用独立 classifier 在**生成 X/HH 原图训练、真实 X/HH 原图测试**，报告 Top-1、Top-5 和四个 depression 分层结果。
 3. 报告 azimuth sweep 的 Δ5、Δ30、0/360 闭环；报告 native geometry 只作诊断，不把 100% class accuracy 当作成功。
 4. 与 V1/MT1 使用同一 TSTR classifier seed、同一真实测试集，避免把数据切分差异误判成改进。
-

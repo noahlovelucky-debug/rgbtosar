@@ -1,6 +1,23 @@
 # 身份优先的 RGB → SAR ROI 联合训练
 
-当前推荐入口是 `train_joint_roi_gan.py`。它和早期 `train_bbox.py` 的关键区别是：
+## 当前最终模型：HiFC 无像素配对 RGB→SAR
+
+当前已经完成并评估的推荐模型是 `hifc_unpaired_conditioned_v1`。它针对 RGB 车辆侧视图
+与 SAR ROI 不同坐标、不同采集的情况，只按车型建立弱语义关系，把目标 SAR 的方位角、
+俯视角、波段和极化作为 12 维条件；训练中不使用 RGB/SAR 像素级重建或平移对齐。
+
+- [最终完整工作流、架构、loss、梯度路径和复现命令](HIFC_UNPAIRED_FINAL_WORKFLOW_ZH.md)
+- [最终训练曲线、流程图、TSTR 图表和原始指标](visualizations/hifc_unpaired_final/README.md)
+- [最终模型代码](code/hifc_unpaired_sar_gan.py) 和 [训练入口](code/train_hifc_unpaired_sar_gan.py)
+
+最终 GAN 已完成 120 epoch。独立 TSTR（生成 SAR 训练分类器、真实 X/HH 测试）三 seed
+平均为 Top-1 `48.32%`、Top-5 `74.42%`；旧 V1 对照约为 `14.75%/39.06%`。这个
+提升说明生成图包含了更多可迁移的真实 SAR 信息，但 native teacher 的近 100% 车型
+准确率仍不能替代 TSTR，生成器的域差异和 shortcut 尚未完全消除。旧的
+`train_joint_roi_gan.py`、V1/MT1 和各项消融记录继续保留，作为历史实验和对照，不代表
+当前最终入口。
+
+历史联合训练入口是 `train_joint_roi_gan.py`。它和早期 `train_bbox.py` 的关键区别是：
 
 - RGB 车辆身份编码器不单独预训练、不冻结，而是在 GAN 每一步中联合更新；随机抽取同车
   另一视图做交叉熵和跨视角特征一致性约束；
