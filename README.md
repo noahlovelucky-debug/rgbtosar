@@ -7,6 +7,7 @@
 俯视角、波段和极化作为 12 维条件；训练中不使用 RGB/SAR 像素级重建或平移对齐。
 
 - [最终完整工作流、架构、loss、梯度路径和复现命令](HIFC_UNPAIRED_FINAL_WORKFLOW_ZH.md)
+- [Epoch 120 逐层张量、clean/Speckle 分支、shortcut 与反传说明](HIFC_EPOCH120_LAYERWISE_ARCHITECTURE_ZH.md)
 - [120 epoch / TSTR 48.32% checkpoint 的可复现实验包](repro/hifc_epoch120_tstr48/README_ZH.md)
 - [下一阶段优化规划：A0 梯度断路、Meta-TSTR 和稀疏复散射场](HIFC_NEXT_OPTIMIZATION_PLAN_ZH.md)
 - [最终训练曲线、流程图、TSTR 图表和原始指标](visualizations/hifc_unpaired_final/README.md)

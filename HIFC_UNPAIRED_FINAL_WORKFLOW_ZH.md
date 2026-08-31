@@ -152,8 +152,9 @@ RGB pyramid:      [B, 64, 64, 64]
 ```
 
 `rgb` 和 `rgb_alt` 使用同一套 encoder 权重。encoder 的 40 类 head 只用于
-`L_rgb_identity`；pyramid 直接注入生成器，防止生成器只拿一个全局向量而丢失车身的
-空间轮廓。
+`L_rgb_identity`；四层 pyramid 都作为生成器的空间调制条件，防止生成器只拿一个全局
+向量而丢失车身的空间轮廓。逐层张量和调制细节见
+[`HIFC_EPOCH120_LAYERWISE_ARCHITECTURE_ZH.md`](HIFC_EPOCH120_LAYERWISE_ARCHITECTURE_ZH.md)。
 
 ### 4.2 一阶段生成器 `HIFCUnpairedGenerator`
 
@@ -185,15 +186,17 @@ z [512] + condition [12]
 2. 固定 `[1,2,1]` separable blur，降低 resize 的棋盘格伪影；
 3. depthwise condition convolution 产生 SPADE-like scale/bias；
 4. 两层卷积、GroupNorm、SiLU 和 residual skip；
-5. 对应尺度的 RGB pyramid 经过 1×1 projection 后加入 decoder。
+5. 对应尺度的 RGB pyramid 通过 depthwise 3×3 和 1×1 卷积产生 SPADE-like
+   `scale/bias`，调制 decoder 的 GroupNorm 后特征；它不直接加到 decoder feature。
 
 clean 输出为 `tanh` 的一通道幅度图。空间噪声是一个 `[B,1,64,64]` 的随机场：
 
 ```text
-correlated = 0.70 * noise + 0.30 * AvgPool3(noise)
+correlated = AvgPool3(noise)
+random_field = 0.70 * noise + 0.30 * correlated
 scale      = 0.04 + 0.38 * sigmoid(noise_scale(feature, clean, correlated))
 bias       = 0.12 * tanh(noise_bias(feature, clean, correlated))
-log_noise  = scale * correlated + bias
+log_noise  = scale * random_field + bias
 log_noise  = mean-center over H/W, then clamp to [-0.8, 0.8]
 ```
 

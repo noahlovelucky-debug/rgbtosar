@@ -4,6 +4,10 @@ This directory freezes the training recipe for the all-condition HiFC checkpoint
 that reached 48.32% X/HH real-SAR TSTR Top-1. It is a reproduction record for
 the checkpoint, not the later `all_off` native-gradient ablation.
 
+For the exact tensor shapes, RGB spatial modulation, clean SAR head, learned
+speckle branch and gradient routes, read
+[`HIFC_EPOCH120_LAYERWISE_ARCHITECTURE_ZH.md`](../../HIFC_EPOCH120_LAYERWISE_ARCHITECTURE_ZH.md).
+
 ## Immutable identities
 
 | Item | Value |
