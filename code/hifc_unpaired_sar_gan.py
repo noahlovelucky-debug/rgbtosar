@@ -128,7 +128,8 @@ def feature_moment_loss(fake: torch.Tensor,
 def semantic_feature_mapping_loss(fake_teacher_feature: torch.Tensor,
                                   real_teacher_feature: torch.Tensor,
                                   fake_discriminator_feature: torch.Tensor | None = None,
-                                  real_discriminator_feature: torch.Tensor | None = None
+                                  real_discriminator_feature: torch.Tensor | None = None,
+                                  teacher_gradient: bool = True
                                   ) -> torch.Tensor:
     """HiFC deep SFM without an image-alignment assumption.
 
@@ -137,7 +138,13 @@ def semantic_feature_mapping_loss(fake_teacher_feature: torch.Tensor,
     added when available.  Both terms are global; the native teacher parameters
     and real features are detached by the caller.
     """
-    fake_norm = F.normalize(fake_teacher_feature, dim=1)
+    # The native teacher is a useful real-SAR representation, but its
+    # decision boundary can become a generator shortcut.  ``teacher_gradient``
+    # therefore controls only the path through its embedding; discriminator
+    # feature moments below remain differentiable in either mode.
+    fake_embedding = (fake_teacher_feature if teacher_gradient
+                      else fake_teacher_feature.detach())
+    fake_norm = F.normalize(fake_embedding, dim=1)
     real_norm = F.normalize(real_teacher_feature.detach(), dim=1)
     cosine = 1.0 - (fake_norm * real_norm).sum(1).mean()
     batch_mean = F.smooth_l1_loss(fake_norm.mean(0), real_norm.mean(0))
@@ -151,14 +158,22 @@ def semantic_feature_mapping_loss(fake_teacher_feature: torch.Tensor,
 def geometry_auxiliary_loss(teacher: nn.Module, fake: torch.Tensor,
                             meta: torch.Tensor,
                             depression: torch.Tensor,
-                            azimuth: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+                            azimuth: torch.Tensor,
+                            teacher_gradient: bool = True
+                            ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Teach band/polarisation/depression/azimuth from a real-only teacher.
 
     This is deliberately separate from the class objective.  A class CE would
     encourage the old native-classifier shortcut; the geometry heads add
     acquisition information that a class-only proxy cannot provide.
     """
-    teacher_logits, features = teacher((fake + 1.0) * .5, return_features=True)
+    if teacher_gradient:
+        teacher_logits, features = teacher((fake + 1.0) * .5,
+                                           return_features=True)
+    else:
+        with torch.no_grad():
+            teacher_logits, features = teacher(
+                ((fake + 1.0) * .5).clamp(0, 1), return_features=True)
     del teacher_logits
     band = (1 - meta[:, 3].round().long()).clamp(0, 1)
     pol = meta[:, 4:8].argmax(1)
@@ -222,4 +237,3 @@ def initialise_hifc(encoder: nn.Module, generator: nn.Module,
     encoder.apply(initialise)
     generator.apply(initialise)
     discriminator.apply(initialise)
-

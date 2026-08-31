@@ -72,6 +72,12 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--ltc-weight", type=float, default=2.0)
     parser.add_argument("--sfm-weight", type=float, default=2.0)
     parser.add_argument("--geometry-weight", type=float, default=.30)
+    parser.add_argument(
+        "--native-gradient-mode", choices=("full", "embedding_off", "all_off"),
+        default="full",
+        help=("native SAR teacher gradient route: full keeps the baseline; "
+              "embedding_off detaches only SFM teacher embeddings; all_off "
+              "also detaches geometry. Teacher metrics are always logged."))
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--local-rank", "--local_rank", type=int, default=-1,
@@ -241,6 +247,7 @@ def checkpoint_state(epoch: int, encoder: nn.Module, generator: nn.Module,
         "discriminator_optimizer": discriminator_optimizer.state_dict(),
         "validation": validation,
         "training_policy": "class-matched unpaired RGB/SAR; no pixel alignment",
+        "native_gradient_mode": args.native_gradient_mode,
         "filters": {"band": args.band, "polarization": args.polarization,
                     "depression": args.depression},
     }
@@ -389,6 +396,10 @@ def main() -> None:
             "sfm": "native pre-classifier embedding cosine/moments + D feature moments",
             "geometry": "frozen native band/polarization/depression/azimuth heads",
         },
+        "gradient_routes": {
+            "native_gradient_mode": args.native_gradient_mode,
+            "teacher_metrics": "always evaluated; mode only changes E/G gradients",
+        },
         "unpaired_policy": "same vehicle class only; source RGB view is random and target SAR condition is metadata",
         "pixel_alignment_used": False,
         "comparison_to_v1": "new standalone HiFC-inspired path; V1 untouched",
@@ -483,19 +494,33 @@ def main() -> None:
                 ltc = local_texture_contrast_loss(
                     differentiable_augment(fake), real_d)
 
-            # Keep the frozen native teacher in FP32.  requires_grad=False on
-            # its parameters still permits a gradient through its input fake.
+            # Keep the frozen native teacher in FP32.  Its parameters are never
+            # trainable, while the selected route controls whether the fake
+            # input receives a gradient through the teacher representation.
+            teacher_embedding_gradient = args.native_gradient_mode == "full"
+            geometry_gradient = args.native_gradient_mode == "full"
+            if args.native_gradient_mode == "embedding_off":
+                geometry_gradient = True
             with torch.autocast(device_type=device.type, enabled=False):
-                fake_logits, fake_teacher_feature = teacher(
-                    ((fake.float() + 1.0) * .5).clamp(0, 1), return_features=True)
+                if teacher_embedding_gradient or geometry_gradient:
+                    fake_logits, fake_teacher_feature = teacher(
+                        ((fake.float() + 1.0) * .5).clamp(0, 1),
+                        return_features=True)
+                else:
+                    with torch.no_grad():
+                        fake_logits, fake_teacher_feature = teacher(
+                            ((fake.float() + 1.0) * .5).clamp(0, 1),
+                            return_features=True)
                 with torch.no_grad():
                     _, real_teacher_feature = teacher(
                         ((real.float() + 1.0) * .5).clamp(0, 1), return_features=True)
                 sfm = semantic_feature_mapping_loss(
                     fake_teacher_feature, real_teacher_feature,
-                    fake_d_feature.float(), real_d_feature.float())
+                    fake_d_feature.float(), real_d_feature.float(),
+                    teacher_gradient=teacher_embedding_gradient)
                 geometry, geometry_terms = geometry_auxiliary_loss(
-                    teacher, fake.float(), meta.float(), depression, azimuth)
+                    teacher, fake.float(), meta.float(), depression, azimuth,
+                    teacher_gradient=geometry_gradient)
                 adv_scale = 0.0 if epoch <= args.adversarial_warmup_epochs else 1.0
                 g_loss = (adv_scale * args.adversarial_weight * adversarial
                           + args.rgb_identity_weight * rgb_loss

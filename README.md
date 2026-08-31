@@ -7,6 +7,7 @@
 俯视角、波段和极化作为 12 维条件；训练中不使用 RGB/SAR 像素级重建或平移对齐。
 
 - [最终完整工作流、架构、loss、梯度路径和复现命令](HIFC_UNPAIRED_FINAL_WORKFLOW_ZH.md)
+- [下一阶段优化规划：A0 梯度断路、Meta-TSTR 和稀疏复散射场](HIFC_NEXT_OPTIMIZATION_PLAN_ZH.md)
 - [最终训练曲线、流程图、TSTR 图表和原始指标](visualizations/hifc_unpaired_final/README.md)
 - [最终模型代码](code/hifc_unpaired_sar_gan.py) 和 [训练入口](code/train_hifc_unpaired_sar_gan.py)
 
