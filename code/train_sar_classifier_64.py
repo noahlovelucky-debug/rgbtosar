@@ -28,8 +28,18 @@ DEPRESSIONS = (15, 30, 45, 60)
 
 
 class SARImageDataset(Dataset):
-    def __init__(self, root: Path, train: bool) -> None:
+    def __init__(self, root: Path, train: bool, band: str = "all",
+                 polarization: str = "all", depression: str = "all") -> None:
         self.root, self.train = Path(root), train
+        if band not in {"all", *BANDS}:
+            raise ValueError(f"unsupported band: {band}")
+        if polarization not in {"all", *POLS}:
+            raise ValueError(f"unsupported polarization: {polarization}")
+        if depression not in {"all", *(str(value) for value in DEPRESSIONS)}:
+            raise ValueError(f"unsupported depression: {depression}")
+        self.band = band
+        self.polarization = polarization
+        self.depression = depression
         self.records: list[tuple[Path, int, int, int, int, int]] = []
         for class_id, class_name in enumerate(SOC40_CLASSES):
             paths = sorted((self.root / class_name).glob("*.tif"))
@@ -40,6 +50,12 @@ class SARImageDataset(Dataset):
                 if match is None:
                     raise RuntimeError(f"unrecognised SAR filename: {path}")
                 band, pol, depression, azimuth = match.groups()
+                if self.band != "all" and band.upper() != self.band:
+                    continue
+                if self.polarization != "all" and pol.upper() != self.polarization:
+                    continue
+                if self.depression != "all" and int(depression) != int(self.depression):
+                    continue
                 azimuth_bin = ((int(azimuth) + 15) % 360) // 30
                 self.records.append((path, class_id, BANDS.index(band.upper()), POLS.index(pol.upper()),
                                      DEPRESSIONS.index(int(depression)), azimuth_bin))
@@ -102,10 +118,79 @@ def evaluate(model: SARClassifier64, loader: DataLoader, device: torch.device) -
     return metrics, detail
 
 
+def fgsm_adversarial_image(model: SARClassifier64, image: torch.Tensor,
+                           labels: torch.Tensor, criterion: nn.Module,
+                           epsilon: float) -> torch.Tensor:
+    """Create a detached single-step FGSM image without accumulating model grads."""
+    if epsilon < 0:
+        raise ValueError("FGSM epsilon must be non-negative")
+    if epsilon == 0:
+        return image.detach()
+    was_training = model.training
+    model.eval()
+    attack_image = image.detach().float().requires_grad_(True)
+    try:
+        attack_logits = model(attack_image)
+        attack_loss = criterion(attack_logits, labels)
+        attack_gradient = torch.autograd.grad(
+            attack_loss, attack_image, retain_graph=False, only_inputs=True)[0]
+    finally:
+        model.train(was_training)
+    return (image.detach().float() + epsilon * attack_gradient.sign()).clamp(0.0, 1.0).detach()
+
+
+def pgd_adversarial_image(model: SARClassifier64, image: torch.Tensor,
+                          labels: torch.Tensor, criterion: nn.Module,
+                          epsilon: float, step_size: float, steps: int) -> torch.Tensor:
+    """Run deterministic zero-start projected sign-gradient ascent in image space."""
+    if epsilon < 0 or step_size <= 0 or steps <= 0:
+        raise ValueError("PGD epsilon must be non-negative, with positive step size and steps")
+    clean = image.detach().float()
+    adversarial = clean.clone()
+    for _ in range(steps):
+        adversarial.requires_grad_(True)
+        logits = model(adversarial)
+        loss = criterion(logits, labels)
+        gradient = torch.autograd.grad(loss, adversarial, retain_graph=False)[0]
+        with torch.no_grad():
+            adversarial = adversarial + step_size * gradient.sign()
+            adversarial = torch.maximum(torch.minimum(adversarial, clean + epsilon), clean - epsilon)
+            adversarial = adversarial.clamp(0.0, 1.0)
+        adversarial = adversarial.detach()
+    return adversarial
+
+
+def evaluate_adversarial(model: SARClassifier64, loader: DataLoader, device: torch.device,
+                          epsilon: float, step_size: float, steps: int) -> dict[str, float]:
+    """Evaluate clean-label classification under a fixed zero-start PGD protocol."""
+    model.eval()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.03)
+    total = correct = top5 = 0
+    loss_sum = 0.0
+    with torch.enable_grad():
+        for image, targets in tqdm(loader, desc="SAR classifier adversarial validation", leave=False):
+            image, targets = image.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+            labels = targets[:, 0]
+            adversarial = pgd_adversarial_image(
+                model, image, labels, criterion, epsilon, step_size, steps)
+            with torch.no_grad():
+                logits = model(adversarial)
+                prediction = logits.argmax(1)
+                loss_sum += criterion(logits, labels).item() * len(labels)
+                correct += (prediction == labels).sum().item()
+                top5 += (logits.topk(5, dim=1).indices == labels[:, None]).any(1).sum().item()
+            total += len(labels)
+    return {"loss": loss_sum / max(total, 1), "top1": correct / max(total, 1),
+            "top5": top5 / max(total, 1), "samples": total,
+            "epsilon": epsilon, "step_size": step_size, "steps": steps}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train an image-only native 64px SAR classifier")
     parser.add_argument("--train-root", type=Path, required=True)
     parser.add_argument("--test-root", type=Path, required=True)
+    parser.add_argument("--band", choices=("all", "X", "KU"), default="all")
+    parser.add_argument("--polarization", choices=("all", "HH", "HV", "VH", "VV"), default="all")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -117,11 +202,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=314)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--fgsm-epsilon", "--adversarial-epsilon", dest="fgsm_epsilon",
+                        type=float, default=0.0,
+                        help="single-step FGSM radius used for every training image; zero preserves V1")
     args = parser.parse_args()
+    if args.fgsm_epsilon < 0 or args.fgsm_epsilon > 1:
+        raise ValueError("--fgsm-epsilon must be in [0, 1]")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
-    train, test = SARImageDataset(args.train_root, True), SARImageDataset(args.test_root, False)
+    train = SARImageDataset(args.train_root, True, args.band, args.polarization)
+    test = SARImageDataset(args.test_root, False, args.band, args.polarization)
     train_loader = DataLoader(train, args.batch_size, shuffle=True, num_workers=args.workers,
                               pin_memory=device.type == "cuda", persistent_workers=args.workers > 0)
     test_loader = DataLoader(test, args.batch_size, shuffle=False, num_workers=args.workers,
@@ -150,8 +241,13 @@ def main() -> None:
         for image, targets in tqdm(train_loader, desc=f"SAR native classifier {epoch}/{args.epochs}"):
             image, targets = image.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
+            if args.fgsm_epsilon:
+                image_for_loss = fgsm_adversarial_image(
+                    model, image, targets[:, 0], class_loss, args.fgsm_epsilon)
+            else:
+                image_for_loss = image
             with torch.amp.autocast(device_type=device.type, enabled=scaler.is_enabled()):
-                logits, features = model(image, return_features=True)
+                logits, features = model(image_for_loss, return_features=True)
                 auxiliary = model.auxiliary_logits(features)
                 loss = class_loss(logits, targets[:, 0])
                 loss = loss + args.aux_weight * sum(
@@ -170,6 +266,12 @@ def main() -> None:
         state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                  "scaler": scaler.state_dict(), "epoch": epoch, "best_top1": max(best_top1, metrics["top1"]),
                  "classes": list(SOC40_CLASSES), "input_size": 64, "metrics": metrics}
+        if args.fgsm_epsilon:
+            state["adversarial_training"] = {
+                "method": "fgsm", "epsilon": args.fgsm_epsilon,
+                "random_start": False, "attack_label_smoothing": 0.03,
+                "final_loss": "original_class_plus_aux_on_adversarial",
+            }
         torch.save(state, args.output / "latest.pt")
         if metrics["top1"] >= best_top1:
             best_top1 = metrics["top1"]; state["best_top1"] = best_top1
@@ -178,7 +280,12 @@ def main() -> None:
         print(dict(zip(("epoch", "train_loss", "train_top1", "test_loss", "test_top1", "test_top5", "lr"), row)), flush=True)
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     config.update({"train_samples": len(train), "test_samples": len(test), "classes": list(SOC40_CLASSES), "best_top1": best_top1,
-                   "input_policy": "SAR intensity image only; filename metadata is supervision only"})
+                   "input_policy": "SAR intensity image only; filename metadata is supervision only",
+                   "adversarial_training": ({
+                       "method": "fgsm", "epsilon": args.fgsm_epsilon,
+                       "random_start": False, "attack_label_smoothing": 0.03,
+                       "final_loss": "original_class_plus_aux_on_adversarial",
+                   } if args.fgsm_epsilon else None)})
     (args.output / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

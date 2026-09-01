@@ -37,6 +37,8 @@ from train_sar_classifier_64 import SARImageDataset
 
 
 DEPRESSION_TO_ID = {15: 0, 30: 1, 45: 2, 60: 3}
+BAND_TO_ID = {"X": 0, "KU": 1}
+POLARIZATION_TO_ID = {"HH": 0, "HV": 1, "VH": 2, "VV": 3}
 
 
 def file_sha256(path: Path) -> str:
@@ -83,10 +85,12 @@ class GeneratedConditionDataset(Dataset):
     """Conditions plus RGB source images; does not load real SAR image pixels."""
 
     def __init__(self, rgb_root: Path, sar_root: Path, rgb_size: int = 128,
-                 include_style_roi: bool = False) -> None:
+                 include_style_roi: bool = False, band: str = "X",
+                 polarization: str = "HH", depression: str = "all") -> None:
         self.include_style_roi = include_style_roi
+        self.band, self.polarization, self.depression = band, polarization, depression
         self.base = JointROIDataset(rgb_root, sar_root, rgb_size=rgb_size, epoch_size=0,
-                                   band="X", polarization="HH", depression="all",
+                                   band=band, polarization=polarization, depression=depression,
                                    augment_rgb=False, source_view_mode="random")
 
     def __len__(self) -> int:
@@ -96,7 +100,9 @@ class GeneratedConditionDataset(Dataset):
         tif, _, class_name, bbox, meta, _ = self.base.records[index]
         source_angle = random.choice(self.base.class_rgb_angles[class_name])
         rgb = self.base._rgb(self.base.rgb_paths[class_name, source_angle])
-        targets = torch.tensor((self.base.class_to_id[class_name], 0, 0,
+        targets = torch.tensor((self.base.class_to_id[class_name],
+                                BAND_TO_ID[str(meta["band"]).upper()],
+                                POLARIZATION_TO_ID[str(meta["pol"]).upper()],
                                 DEPRESSION_TO_ID[int(meta["depression"])],
                                 ((int(meta["azimuth"]) + 15) % 360) // 30), dtype=torch.long)
         if self.include_style_roi:
@@ -210,6 +216,12 @@ def main() -> None:
     parser.add_argument("--checkpoint-selection", choices=("final", "real_test_legacy"), default="final",
                         help="select the final fixed epoch (default) or reproduce the old test-set selection")
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--train-band", choices=("all", "X", "KU"), default="X",
+                        help="band conditions used for real and generated classifier training")
+    parser.add_argument("--train-polarization", choices=("all", "HH", "HV", "VH", "VV"), default="HH",
+                        help="polarization conditions used for real and generated classifier training")
+    parser.add_argument("--train-depression", choices=("all", "15", "30", "45", "60"), default="all",
+                        help="depression conditions used for real and generated classifier training")
     parser.add_argument("--real-train-root", type=Path,
                         help="optional real SAR train root to mix with generated samples")
     parser.add_argument("--real-fraction", type=float, default=0.0,
@@ -252,6 +264,8 @@ def main() -> None:
             raise ValueError("--meta-probe requires --checkpoint-selection final")
         if args.style_source != "prior":
             raise ValueError("--meta-probe cannot use a real-ROI posterior style")
+        if (args.train_band, args.train_polarization, args.train_depression) != ("X", "HH", "all"):
+            raise ValueError("--meta-probe requires the registered X/HH/all condition corpus")
         if args.real_test_root is not None:
             raise ValueError("--meta-probe must omit --real-test-root so no real test is touched")
         if args.real_fraction != 0.0 or args.real_train_root is not None:
@@ -316,8 +330,11 @@ def main() -> None:
 
     if args.style_source == "posterior" and architecture != "continuous_spatial_style_v2":
         raise ValueError("--style-source posterior requires a continuous_spatial_style_v2 checkpoint")
-    generated_train = GeneratedConditionDataset(args.rgb_root, args.condition_root,
-                                                include_style_roi=args.style_source == "posterior")
+    generated_train = GeneratedConditionDataset(
+        args.rgb_root, args.condition_root,
+        include_style_roi=args.style_source == "posterior",
+        band=args.train_band, polarization=args.train_polarization,
+        depression=args.train_depression)
     manifest_path = None
     if args.meta_probe:
         manifest_path = args.generated_train_manifest or args.output / "generated_train_manifest.json"
@@ -325,7 +342,10 @@ def main() -> None:
     real_test = None if args.meta_probe else RealXHHTestDataset(args.real_test_root)
     real_train = None
     if args.real_fraction > 0.0:
-        real_train = SARImageDataset(args.real_train_root, train=True, band="X", polarization="HH")
+        real_train = SARImageDataset(
+            args.real_train_root, train=True,
+            band=args.train_band, polarization=args.train_polarization,
+            depression=args.train_depression)
         synthetic_batch_size = max(1, int(round(args.batch_size * (1.0 - args.real_fraction))))
         real_batch_size = args.batch_size - synthetic_batch_size
         if real_batch_size < 1:
@@ -463,10 +483,13 @@ def main() -> None:
         saved = {"model": classifier.state_dict(), "epoch": epoch, "classes": list(SOC40_CLASSES), "input_size": 64,
                  "metrics": metrics, "gan_checkpoint": str(args.gan_checkpoint),
                  "training_source": (
-                     "frozen GAN samples plus real X/HH train pixels"
+                     "frozen GAN samples plus real train pixels"
                      if real_train is not None else "frozen GAN samples only"),
                  "real_fraction": args.real_fraction,
-                 "real_train_root": str(args.real_train_root) if args.real_train_root is not None else None}
+                 "real_train_root": str(args.real_train_root) if args.real_train_root is not None else None,
+                 "train_band": args.train_band,
+                 "train_polarization": args.train_polarization,
+                 "train_depression": args.train_depression}
         if args.meta_probe:
             assert manifest_path is not None
             saved["meta_probe_metadata"] = {
@@ -507,12 +530,15 @@ def main() -> None:
         "real_fraction": args.real_fraction,
         "real_test_samples": len(real_test) if real_test is not None else 0,
         "checkpoint_selection": args.checkpoint_selection,
+        "train_band": args.train_band,
+        "train_polarization": args.train_polarization,
+        "train_depression": args.train_depression,
         "training_policy": (
             "classifier sees generated pixels only; generator samples a frozen empirical spatial-code prior "
             "learned from real train SAR" if architecture == "continuous_spatial_codebook_v3" else
             "classifier sees generated pixels only; posterior diagnostic uses real train ROI only "
             "inside the frozen style encoder" if args.style_source == "posterior" else
-            "frozen GAN samples plus real X/HH train pixels"
+            "frozen GAN samples plus real train pixels"
             if real_train is not None else
             "no real SAR pixels in classifier training; real train root supplies condition labels only")}
     if args.meta_probe:
