@@ -214,6 +214,9 @@ def main() -> None:
                         help="optional real SAR train root to mix with generated samples")
     parser.add_argument("--real-fraction", type=float, default=0.0,
                         help="fraction of each classifier batch drawn from real X/HH train ROIs")
+    parser.add_argument("--steps-per-epoch", type=int, default=0,
+                        help=("optional fixed optimizer updates per epoch; useful for "
+                              "compute-matched real/generated comparisons"))
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--weight-decay", type=float, default=2e-4)
@@ -233,6 +236,8 @@ def main() -> None:
     args = parser.parse_args()
     if not 0.0 <= args.real_fraction < 1.0:
         raise ValueError("--real-fraction must be in [0, 1)")
+    if args.steps_per_epoch < 0:
+        raise ValueError("--steps-per-epoch must be non-negative")
     if args.real_fraction > 0.0 and args.real_train_root is None:
         raise ValueError("--real-fraction > 0 requires --real-train-root")
     if args.meta_probe:
@@ -356,8 +361,8 @@ def main() -> None:
         classifier.train(); loss_sum = correct = total = 0
         synthetic_correct = synthetic_total = real_correct = real_total = 0
         real_iterator = iter(real_loader) if real_loader is not None else None
-        for rgb, meta, source_angle, targets, style_roi in tqdm(
-                train_loader, desc=f"synthetic SAR classifier {epoch}/{args.epochs}"):
+        for batch_index, (rgb, meta, source_angle, targets, style_roi) in enumerate(tqdm(
+                train_loader, desc=f"synthetic SAR classifier {epoch}/{args.epochs}")):
             rgb, meta = rgb.to(device, non_blocking=True), meta.to(device, non_blocking=True)
             source_angle, targets = source_angle.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             with torch.inference_mode():
@@ -440,6 +445,8 @@ def main() -> None:
             if real_targets is not None:
                 real_correct += (prediction[synthetic_count:] == real_targets[:, 0]).sum().item()
                 real_total += len(real_targets)
+            if args.steps_per_epoch and batch_index + 1 >= args.steps_per_epoch:
+                break
         if real_test is None:
             metrics, by_depression = ({"loss": float("nan"), "top1": float("nan"),
                                        "top5": float("nan"), "samples": 0,
@@ -495,6 +502,7 @@ def main() -> None:
     config = {**{key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "gan_architecture": architecture,
         "synthetic_train_samples_per_epoch": len(generated_train),
+        "steps_per_epoch": (args.steps_per_epoch or len(train_loader)),
         "real_train_samples": len(real_train) if real_train is not None else 0,
         "real_fraction": args.real_fraction,
         "real_test_samples": len(real_test) if real_test is not None else 0,

@@ -77,6 +77,10 @@ torchrun --standalone --nproc_per_node=8 \
 
 当前服务器的 tmux 会话名为 `hifc_c2ot_sfm_full`，日志在 `code/runs/hifc_c2ot_sfm_full_ddp/run.log`。`config.json` 保存完整参数，`history.csv` 保存每 epoch 的 loss/teacher 诊断，`validation_*.png` 保存 RGB、real、clean、observed fake 对照。
 
+## 分类器诊断
+
+`train_generated_sar_classifier_64.py` 支持 `--real-fraction` 做真实+生成混合诊断，支持 `--steps-per-epoch` 固定 optimizer 更新次数。严格 TSTR 不传 `--real-train-root`；compute-matched 的 50% 混合实验应使用与 synthetic-only 相同的 `--steps-per-epoch 95`，否则生成 batch 减半会让每个 epoch 的更新次数翻倍。混合实验的 test 结果只表示低资源增强能力，不等价于 TSTR。
+
 ## 验收标准
 
 native class accuracy 仅作为诊断，不能用来选择 checkpoint。最终用冻结 GAN 生成的图训练独立 image-only CNN，在未参与生成训练的真实 X/HH test 上报告 Top-1、Top-5、四个 depression 分层、azimuth circular MAE 和 bootstrap CI。三 classifier seeds 的平均 Top-1 目标是相对旧 48.32% 至少提升 3 个百分点，Top-5 至少提升 2 个百分点；任何 seed 不下降超过 1 个百分点。混合真实+生成分类器结果只用于低资源诊断，不能替代 TSTR。
