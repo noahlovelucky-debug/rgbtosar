@@ -4,9 +4,10 @@ from __future__ import annotations
 import torch
 
 from hifc_unpaired_sar_gan import (
-    CONDITION_DIM, HIFCConditionedDiscriminator, HIFCUnpairedGenerator,
-    condition_from_batch, geometry_auxiliary_loss,
-    local_texture_contrast_loss, semantic_feature_mapping_loss)
+    CONDITION_DIM, ConditionalPrototypeBank, HIFCConditionedDiscriminator,
+    HIFCUnpairedGenerator, condition_from_batch, conditional_set_sfm_loss,
+    geometry_auxiliary_loss, local_texture_contrast_loss,
+    semantic_feature_mapping_loss)
 from dual_component_sar_gan import LargeRGBIdentityEncoder
 from sar_classifier_64 import SARClassifier64
 
@@ -93,6 +94,41 @@ def test_geometry_teacher_gradient_switch() -> None:
     loss, _ = geometry_auxiliary_loss(
         ToyTeacher(), fake, meta, depression, azimuth, teacher_gradient=False)
     assert not loss.requires_grad
+
+
+def test_conditional_set_sfm_is_permutation_invariant_and_differentiable() -> None:
+    """C2OT compares sets, while only fake features receive its gradient."""
+    torch.manual_seed(13)
+    batch, embedding_dim, signature_dim = 8, 384, 15
+    group_code = torch.tensor([1, 1, 2, 2, 3, 3, 4, 4])
+    codes = group_code.unique()
+    embedding_mean = torch.randn(len(codes), embedding_dim)
+    embedding_std = torch.rand(len(codes), embedding_dim) + .5
+    ltc_mean = torch.randn(len(codes), signature_dim)
+    ltc_std = torch.rand(len(codes), signature_dim) + .5
+    bank = ConditionalPrototypeBank(
+        codes, embedding_mean, embedding_std, ltc_mean, ltc_std,
+        embedding_mean.mean(0), embedding_std.mean(0),
+        ltc_mean.mean(0), ltc_std.mean(0))
+    fake = torch.randn(batch, embedding_dim, requires_grad=True)
+    fake_ltc = torch.randn(batch, signature_dim, requires_grad=True)
+    real = torch.randn(batch, embedding_dim)
+    real_ltc = torch.randn(batch, signature_dim)
+    loss = conditional_set_sfm_loss(
+        fake, real, fake_ltc, real_ltc, group_code, group_code, bank,
+        projection_count=8)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert fake.grad is not None and torch.isfinite(fake.grad).all()
+    assert fake_ltc.grad is not None and torch.isfinite(fake_ltc.grad).all()
+    permutation = torch.tensor([3, 0, 7, 2, 5, 1, 6, 4])
+    with torch.no_grad():
+        permuted = conditional_set_sfm_loss(
+            fake.detach()[permutation], real[permutation],
+            fake_ltc.detach()[permutation], real_ltc[permutation],
+            group_code[permutation], group_code[permutation], bank,
+            projection_count=8)
+    assert torch.allclose(loss.detach(), permuted, atol=1e-6)
 
 
 if __name__ == "__main__":
