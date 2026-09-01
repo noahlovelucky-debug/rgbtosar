@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
@@ -26,6 +27,112 @@ from v4_spade_gan import ProjectionPatchDiscriminator
 HIFC_ARCHITECTURE = "hifc_unpaired_conditioned_v1"
 CONDITION_DIM = 12
 DEPRESSION_VALUES = (15, 30, 45, 60)
+
+
+def condition_group_code(class_id: torch.Tensor, meta: torch.Tensor,
+                         depression: torch.Tensor) -> torch.Tensor:
+    """Encode the non-angular SAR acquisition group as one stable integer.
+
+    The group deliberately excludes azimuth: azimuth is continuous/circular
+    and is supervised by the geometry heads.  Grouping by class, band,
+    polarization and depression supplies enough real examples for a set loss
+    without pretending that an RGB/SAR pair is pixel registered.
+    """
+    band = (1 - meta[:, 3].round().long()).clamp(0, 1)
+    polarization = meta[:, 4:8].argmax(1)
+    dep = torch.round(depression.float() / 15.0).long().sub(1).clamp(0, 3)
+    return (((class_id.long() * 2 + band) * 4 + polarization) * 4 + dep)
+
+
+class ConditionalPrototypeBank:
+    """Frozen real-SAR statistics used by the conditional set SFM loss.
+
+    ``codes`` are the values returned by :func:`condition_group_code`.  The
+    bank stores native-teacher and LTC means/stds, plus global fallbacks for a
+    condition that is absent from a particular filtered training split.
+    """
+
+    def __init__(self, codes: torch.Tensor, embedding_mean: torch.Tensor,
+                 embedding_std: torch.Tensor, ltc_mean: torch.Tensor,
+                 ltc_std: torch.Tensor, global_embedding_mean: torch.Tensor,
+                 global_embedding_std: torch.Tensor,
+                 global_ltc_mean: torch.Tensor, global_ltc_std: torch.Tensor,
+                 device: torch.device | None = None) -> None:
+        self.codes = codes.long()
+        self.embedding_mean = embedding_mean.float()
+        self.embedding_std = embedding_std.float()
+        self.ltc_mean = ltc_mean.float()
+        self.ltc_std = ltc_std.float()
+        self.global_embedding_mean = global_embedding_mean.float()
+        self.global_embedding_std = global_embedding_std.float()
+        self.global_ltc_mean = global_ltc_mean.float()
+        self.global_ltc_std = global_ltc_std.float()
+        self._index = {int(code): index for index, code in enumerate(self.codes.tolist())}
+        if device is not None:
+            self.to(device)
+
+    def to(self, device: torch.device) -> "ConditionalPrototypeBank":
+        for name in ("codes", "embedding_mean", "embedding_std", "ltc_mean",
+                     "ltc_std", "global_embedding_mean", "global_embedding_std",
+                     "global_ltc_mean", "global_ltc_std"):
+            setattr(self, name, getattr(self, name).to(device))
+        return self
+
+    def lookup(self, codes: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        indices = torch.tensor([self._index.get(int(code), -1)
+                                for code in codes.detach().cpu().tolist()],
+                               dtype=torch.long, device=codes.device)
+        present = indices >= 0
+        safe = indices.clamp_min(0)
+        embedding_mean = self.embedding_mean[safe].clone()
+        embedding_std = self.embedding_std[safe].clone()
+        ltc_mean = self.ltc_mean[safe].clone()
+        ltc_std = self.ltc_std[safe].clone()
+        if (~present).any():
+            embedding_mean[~present] = self.global_embedding_mean
+            embedding_std[~present] = self.global_embedding_std
+            ltc_mean[~present] = self.global_ltc_mean
+            ltc_std[~present] = self.global_ltc_std
+        return embedding_mean, embedding_std, ltc_mean, ltc_std
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {
+            "codes": self.codes.detach().cpu(),
+            "embedding_mean": self.embedding_mean.detach().cpu(),
+            "embedding_std": self.embedding_std.detach().cpu(),
+            "ltc_mean": self.ltc_mean.detach().cpu(),
+            "ltc_std": self.ltc_std.detach().cpu(),
+            "global_embedding_mean": self.global_embedding_mean.detach().cpu(),
+            "global_embedding_std": self.global_embedding_std.detach().cpu(),
+            "global_ltc_mean": self.global_ltc_mean.detach().cpu(),
+            "global_ltc_std": self.global_ltc_std.detach().cpu(),
+        }
+
+
+def _fixed_sfm_projections(dim: int, count: int, device: torch.device) -> torch.Tensor:
+    """Return deterministic normalized projections without touching training RNG."""
+    key = (dim, count, str(device))
+    cache = getattr(_fixed_sfm_projections, "_cache", {})
+    if key not in cache:
+        generator = torch.Generator(device="cpu").manual_seed(20260901 + dim + count)
+        projection = torch.randn(count, dim, generator=generator)
+        projection = F.normalize(projection, dim=1)
+        cache[key] = projection.to(device)
+        _fixed_sfm_projections._cache = cache
+    return cache[key]
+
+
+def _ddp_set_gather(value: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Gather a set while retaining the local fake branch's autograd path."""
+    if not dist.is_available() or not dist.is_initialized():
+        return value, False
+    gathered = [torch.empty_like(value) for _ in range(dist.get_world_size())]
+    # ``all_gather`` itself has no autograd support.  Replacing the local slot
+    # with the original tensor gives this rank the correct fake gradient; DDP
+    # averages the corresponding partial gradients across ranks.
+    dist.all_gather(gathered, value.detach())
+    gathered[dist.get_rank()] = value
+    return torch.cat(gathered, dim=0), True
 
 
 class HIFCUnpairedGenerator(OneStageWaveletSARGenerator):
@@ -149,6 +256,91 @@ def semantic_feature_mapping_loss(fake_teacher_feature: torch.Tensor,
     cosine = 1.0 - (fake_norm * real_norm).sum(1).mean()
     batch_mean = F.smooth_l1_loss(fake_norm.mean(0), real_norm.mean(0))
     total = cosine + .5 * batch_mean
+    if fake_discriminator_feature is not None and real_discriminator_feature is not None:
+        total = total + .5 * feature_moment_loss(
+            fake_discriminator_feature, real_discriminator_feature)
+    return total
+
+
+def conditional_set_sfm_loss(
+        fake_teacher_feature: torch.Tensor,
+        real_teacher_feature: torch.Tensor,
+        fake_ltc_signature: torch.Tensor,
+        real_ltc_signature: torch.Tensor,
+        fake_group_code: torch.Tensor,
+        real_group_code: torch.Tensor,
+        prototypes: ConditionalPrototypeBank,
+        fake_discriminator_feature: torch.Tensor | None = None,
+        real_discriminator_feature: torch.Tensor | None = None,
+        teacher_gradient: bool = True,
+        projection_count: int = 16,
+        ltc_weight: float = .50,
+        anchor_weight: float = .25,
+        ddp_global_set: bool = False) -> torch.Tensor:
+    """Conditional set-level SFM for genuinely unpaired RGB/SAR examples.
+
+    A conventional SFM term compares item ``i`` with item ``i``.  That is an
+    implicit pairing assumption and can teach the generator a shortcut when
+    the two items only share a class label.  This replacement first removes a
+    frozen real-SAR prototype for each acquisition group and whitens both
+    domains.  A fixed sliced-Wasserstein distance then compares the sorted
+    projected *sets*; no image coordinate or batch position is matched.  The
+    prototype cosine anchor retains the class/condition identity signal.
+
+    The discriminator feature-moment term is intentionally unchanged and is
+    included when the shared critic supplies features.  Real tensors and the
+    prototype bank are detached, so only fake/E/G receives this loss gradient.
+    """
+    if fake_teacher_feature.ndim != 2 or real_teacher_feature.ndim != 2:
+        raise ValueError("teacher features must have shape [B,C]")
+    if fake_teacher_feature.shape[0] != fake_ltc_signature.shape[0]:
+        raise ValueError("fake teacher/LTC batch sizes differ")
+    fake_embedding = (fake_teacher_feature if teacher_gradient
+                      else fake_teacher_feature.detach())
+    real_embedding = real_teacher_feature.detach()
+    fake_ltc = fake_ltc_signature if teacher_gradient else fake_ltc_signature.detach()
+    real_ltc = real_ltc_signature.detach()
+    fake_mu, fake_std, fake_ltc_mu, fake_ltc_std = prototypes.lookup(fake_group_code)
+    real_mu, real_std, real_ltc_mu, real_ltc_std = prototypes.lookup(real_group_code)
+    eps = 1e-3
+    fake_e = (fake_embedding - fake_mu) / fake_std.clamp_min(eps)
+    real_e = (real_embedding - real_mu) / real_std.clamp_min(eps)
+    fake_t = (fake_ltc - fake_ltc_mu) / fake_ltc_std.clamp_min(eps)
+    real_t = (real_ltc - real_ltc_mu) / real_ltc_std.clamp_min(eps)
+
+    # Equalize the contribution of the 384-D teacher vector and the 15-D LTC
+    # signature before projecting.  Whitening makes the comparison invariant
+    # to per-channel native-teacher scale while retaining residual structure.
+    fake_joint = torch.cat((fake_e / math.sqrt(fake_e.shape[1]),
+                            ltc_weight * fake_t / math.sqrt(fake_t.shape[1])), dim=1)
+    real_joint = torch.cat((real_e / math.sqrt(real_e.shape[1]),
+                            ltc_weight * real_t / math.sqrt(real_t.shape[1])), dim=1)
+    if ddp_global_set:
+        fake_joint, gathered = _ddp_set_gather(fake_joint)
+        real_joint, real_gathered = _ddp_set_gather(real_joint)
+        if gathered != real_gathered:
+            raise RuntimeError("SFM DDP gather state differs between fake and real sets")
+    else:
+        gathered = False
+    projections = _fixed_sfm_projections(fake_joint.shape[1], projection_count,
+                                         fake_joint.device).to(fake_joint.dtype)
+    fake_projected = fake_joint @ projections.t()
+    real_projected = real_joint @ projections.t()
+    # In one dimension the optimal transport plan is sorting.  smooth_l1 is a
+    # robust approximation of the 1-Wasserstein cost and remains stable for
+    # the small per-rank DDP batch sizes used by this trainer.
+    fake_sorted = fake_projected.sort(dim=0).values
+    real_sorted = real_projected.sort(dim=0).values
+    sliced = F.smooth_l1_loss(fake_sorted, real_sorted)
+    if gathered:
+        # DDP averages gradients across ranks.  The global set loss is already
+        # a mean over all ranks, so restore the baseline gradient scale.
+        sliced = sliced * dist.get_world_size()
+
+    fake_norm = F.normalize(fake_embedding, dim=1)
+    prototype_norm = F.normalize(fake_mu.detach(), dim=1)
+    anchor = 1.0 - (fake_norm * prototype_norm).sum(1).mean()
+    total = sliced + anchor_weight * anchor
     if fake_discriminator_feature is not None and real_discriminator_feature is not None:
         total = total + .5 * feature_moment_loss(
             fake_discriminator_feature, real_discriminator_feature)

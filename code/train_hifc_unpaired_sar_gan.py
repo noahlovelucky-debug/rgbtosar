@@ -26,17 +26,20 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 
 from dual_component_sar_gan import LargeRGBIdentityEncoder
 from hifc_unpaired_sar_gan import (
     HIFC_ARCHITECTURE, HIFCConditionedDiscriminator, HIFCUnpairedGenerator,
-    condition_from_batch, discriminator_hinge, geometry_auxiliary_loss,
+    ConditionalPrototypeBank, condition_from_batch, condition_group_code,
+    conditional_set_sfm_loss, discriminator_hinge, geometry_auxiliary_loss,
     initialise_hifc, local_texture_contrast_loss,
-    parameter_count, rgb_identity_loss, semantic_feature_mapping_loss,
+    local_texture_signature, parameter_count, rgb_identity_loss,
+    semantic_feature_mapping_loss,
     set_grad, update_ema)
 from joint_data import JointROIDataset
+from bbox_data import image_tensor
 from sar_classifier_64 import SARClassifier64
 from saratrx import SOC40_CLASSES
 
@@ -71,6 +74,16 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--rgb-identity-weight", type=float, default=1.0)
     parser.add_argument("--ltc-weight", type=float, default=2.0)
     parser.add_argument("--sfm-weight", type=float, default=2.0)
+    parser.add_argument("--sfm-mode", choices=("batch", "conditional_set_ot"),
+                        default="batch",
+                        help=("SFM implementation; batch preserves the original "
+                              "itemwise baseline, conditional_set_ot uses a "
+                              "frozen condition-prototype whitened set loss"))
+    parser.add_argument("--sfm-projection-count", type=int, default=64)
+    parser.add_argument("--sfm-ltc-cost-weight", type=float, default=.50)
+    parser.add_argument("--sfm-anchor-weight", type=float, default=.25)
+    parser.add_argument("--sfm-prototype-batch-size", type=int, default=128)
+    parser.add_argument("--sfm-prototype-cache", type=Path)
     parser.add_argument("--geometry-weight", type=float, default=.30)
     parser.add_argument(
         "--native-gradient-mode", choices=("full", "embedding_off", "all_off"),
@@ -186,6 +199,131 @@ def configure_records(dataset: JointROIDataset, selected: set[str], root: Path,
     dataset.random_epoch = bool(epoch_size)
 
 
+class RealSARPrototypeDataset(Dataset):
+    """Read only real SAR records for the frozen SFM prototype cache."""
+
+    def __init__(self, records: list[tuple], roi_size: int = 64) -> None:
+        self.records = records
+        self.roi_size = roi_size
+        self.class_to_id = {name: index for index, name in enumerate(SOC40_CLASSES)}
+        self.polarization_to_id = {name: index for index, name in enumerate(
+            ("HH", "HV", "VH", "VV"))}
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        tif, _, class_name, _, meta, _ = self.records[index]
+        with Image.open(tif) as image:
+            roi = image_tensor(image, self.roi_size, False)
+        class_id = self.class_to_id[class_name]
+        band = 0 if str(meta["band"]).upper() == "X" else 1
+        polarization = self.polarization_to_id[str(meta["pol"]).upper()]
+        depression = (int(meta["depression"]) // 15) - 1
+        code = (((class_id * 2 + band) * 4 + polarization) * 4 + depression)
+        return roi, code
+
+
+def _prototype_split_digest(records: list[tuple], root: Path) -> str:
+    names = sorted(str(record[0].relative_to(root)) for record in records)
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+
+
+def _prototype_cache_signature(args: argparse.Namespace,
+                               records: list[tuple]) -> dict[str, object]:
+    checkpoint = args.native_classifier_checkpoint
+    stat = checkpoint.stat()
+    return {
+        "version": 1,
+        "architecture": HIFC_ARCHITECTURE,
+        "source_root": str(args.sar_train_root.resolve()),
+        "split_digest": _prototype_split_digest(records, args.sar_train_root),
+        "teacher": {"path": str(checkpoint.resolve()), "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns},
+        "roi_size": 64,
+        "std_floor": .05,
+    }
+
+
+def build_prototype_bank(records: list[tuple], teacher: SARClassifier64,
+                         device: torch.device, batch_size: int,
+                         workers: int) -> ConditionalPrototypeBank:
+    """Compute train-only native/LTC statistics once, without RGB reads."""
+    dataset = RealSARPrototypeDataset(records)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        num_workers=max(0, min(workers, 4)),
+                        pin_memory=device.type == "cuda",
+                        persistent_workers=workers > 0)
+    counts: dict[int, int] = defaultdict(int)
+    sums: dict[int, torch.Tensor] = {}
+    squares: dict[int, torch.Tensor] = {}
+    ltc_sums: dict[int, torch.Tensor] = {}
+    ltc_squares: dict[int, torch.Tensor] = {}
+    total_count = 0
+    total_sum = total_square = None
+    total_ltc_sum = total_ltc_square = None
+    teacher.eval()
+    with torch.inference_mode():
+        for images, codes in tqdm(loader, desc="SFM real prototype cache", leave=False):
+            images = images.to(device, non_blocking=True)
+            codes = codes.long()
+            _, features = teacher(((images + 1.0) * .5).clamp(0, 1),
+                                  return_features=True)
+            signatures = local_texture_signature(images)
+            features_cpu = features.float().cpu()
+            signatures_cpu = signatures.float().cpu()
+            if total_sum is None:
+                total_sum = torch.zeros(features_cpu.shape[1], dtype=torch.float64)
+                total_square = torch.zeros_like(total_sum)
+                total_ltc_sum = torch.zeros(signatures_cpu.shape[1], dtype=torch.float64)
+                total_ltc_square = torch.zeros_like(total_ltc_sum)
+            total_count += len(codes)
+            total_sum += features_cpu.double().sum(0)
+            total_square += features_cpu.double().square().sum(0)
+            total_ltc_sum += signatures_cpu.double().sum(0)
+            total_ltc_square += signatures_cpu.double().square().sum(0)
+            for code in codes.unique().tolist():
+                mask = codes == code
+                feature_rows = features_cpu[mask].double()
+                ltc_rows = signatures_cpu[mask].double()
+                counts[code] += int(mask.sum())
+                if code not in sums:
+                    sums[code] = torch.zeros_like(total_sum)
+                    squares[code] = torch.zeros_like(total_sum)
+                    ltc_sums[code] = torch.zeros_like(total_ltc_sum)
+                    ltc_squares[code] = torch.zeros_like(total_ltc_sum)
+                sums[code] += feature_rows.sum(0)
+                squares[code] += feature_rows.square().sum(0)
+                ltc_sums[code] += ltc_rows.sum(0)
+                ltc_squares[code] += ltc_rows.square().sum(0)
+    if not total_count or total_sum is None:
+        raise RuntimeError("cannot build SFM prototypes from an empty split")
+
+    floor = .05
+    global_mean = total_sum / total_count
+    global_std = (total_square / total_count - global_mean.square()).clamp_min(floor ** 2).sqrt()
+    global_ltc_mean = total_ltc_sum / total_count
+    global_ltc_std = (total_ltc_square / total_count - global_ltc_mean.square()).clamp_min(floor ** 2).sqrt()
+    codes_sorted = sorted(counts)
+    embedding_mean, embedding_std, ltc_mean, ltc_std = [], [], [], []
+    for code in codes_sorted:
+        count = counts[code]
+        mean = sums[code] / count
+        std = (squares[code] / count - mean.square()).clamp_min(floor ** 2).sqrt()
+        ltc_mean_row = ltc_sums[code] / count
+        ltc_std_row = (ltc_squares[code] / count - ltc_mean_row.square()).clamp_min(floor ** 2).sqrt()
+        embedding_mean.append(mean.float())
+        embedding_std.append(std.float())
+        ltc_mean.append(ltc_mean_row.float())
+        ltc_std.append(ltc_std_row.float())
+    return ConditionalPrototypeBank(
+        torch.tensor(codes_sorted, dtype=torch.long),
+        torch.stack(embedding_mean), torch.stack(embedding_std),
+        torch.stack(ltc_mean), torch.stack(ltc_std),
+        global_mean.float(), global_std.float(),
+        global_ltc_mean.float(), global_ltc_std.float())
+
+
 def differentiable_augment(image: torch.Tensor) -> torch.Tensor:
     """Shared radiometric augmentation; no domain-specific spatial warp."""
     batch = len(image)
@@ -232,7 +370,8 @@ def checkpoint_state(epoch: int, encoder: nn.Module, generator: nn.Module,
                      discriminator: nn.Module, ema_encoder: nn.Module,
                      ema_generator: nn.Module, generator_optimizer: torch.optim.Optimizer,
                      discriminator_optimizer: torch.optim.Optimizer,
-                     validation: dict[str, float], args: argparse.Namespace) -> dict:
+                     validation: dict[str, float], args: argparse.Namespace,
+                     sfm_prototype_cache: Path | None = None) -> dict:
     return {
         "architecture": HIFC_ARCHITECTURE,
         "epoch": epoch,
@@ -248,6 +387,9 @@ def checkpoint_state(epoch: int, encoder: nn.Module, generator: nn.Module,
         "validation": validation,
         "training_policy": "class-matched unpaired RGB/SAR; no pixel alignment",
         "native_gradient_mode": args.native_gradient_mode,
+        "sfm_mode": args.sfm_mode,
+        "sfm_prototype_cache": (str(sfm_prototype_cache)
+                                 if sfm_prototype_cache is not None else None),
         "filters": {"band": args.band, "polarization": args.polarization,
                     "depression": args.depression},
     }
@@ -257,6 +399,8 @@ def main() -> None:
     args = arguments()
     if args.epochs <= 0 or args.batch_size <= 0 or args.epoch_size <= 0:
         raise ValueError("epochs, batch-size and epoch-size must be positive")
+    if args.sfm_projection_count <= 0 or args.sfm_prototype_batch_size <= 0:
+        raise ValueError("SFM projection and prototype batch sizes must be positive")
     distributed, world_size, rank, local_rank, device = setup_distributed(args)
     is_main = rank == 0
     if distributed:
@@ -316,6 +460,42 @@ def main() -> None:
         validation_sampler)
 
     teacher = load_teacher(args.native_classifier_checkpoint, device)
+    sfm_prototype_cache = None
+    sfm_cache_signature = None
+    prototype_bank = None
+    if args.sfm_mode == "conditional_set_ot":
+        sfm_prototype_cache = (args.sfm_prototype_cache or
+                               (args.output /
+                                f"sfm_prototypes__{args.band}_{args.polarization}_{args.depression}.pt"))
+        signature = _prototype_cache_signature(args, train_data.records)
+        sfm_cache_signature = signature
+        if is_main:
+            sfm_prototype_cache.parent.mkdir(parents=True, exist_ok=True)
+            cache_valid = False
+            if sfm_prototype_cache.is_file():
+                try:
+                    saved_cache = torch.load(sfm_prototype_cache, map_location="cpu",
+                                             weights_only=True)
+                    cache_valid = saved_cache.get("signature") == signature
+                except Exception:
+                    cache_valid = False
+            if not cache_valid:
+                print("building frozen train-only SFM prototype cache", flush=True)
+                built_bank = build_prototype_bank(
+                    train_data.records, teacher, device,
+                    args.sfm_prototype_batch_size, args.workers)
+                payload = {"signature": signature, "bank": built_bank.state_dict()}
+                temporary = sfm_prototype_cache.with_suffix(
+                    sfm_prototype_cache.suffix + f".{os.getpid()}.tmp")
+                torch.save(payload, temporary)
+                temporary.replace(sfm_prototype_cache)
+        if distributed:
+            dist.barrier()
+        saved_cache = torch.load(sfm_prototype_cache, map_location="cpu",
+                                 weights_only=True)
+        if saved_cache.get("signature") != signature:
+            raise RuntimeError("SFM prototype cache provenance mismatch")
+        prototype_bank = ConditionalPrototypeBank(**saved_cache["bank"], device=device)
     encoder = LargeRGBIdentityEncoder(len(SOC40_CLASSES)).to(device)
     generator = HIFCUnpairedGenerator().to(device)
     discriminator = HIFCConditionedDiscriminator().to(device)
@@ -338,6 +518,11 @@ def main() -> None:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
         if saved.get("architecture") != HIFC_ARCHITECTURE:
             raise RuntimeError("--resume architecture mismatch")
+        saved_sfm_mode = saved.get("sfm_mode", "batch")
+        if saved_sfm_mode != args.sfm_mode:
+            raise RuntimeError(
+                f"--resume SFM mode mismatch: checkpoint={saved_sfm_mode}, "
+                f"requested={args.sfm_mode}")
         encoder.load_state_dict(saved["identity_encoder"])
         generator.load_state_dict(saved["generator"])
         discriminator.load_state_dict(saved["discriminator"])
@@ -393,9 +578,15 @@ def main() -> None:
             "rgb_identity": "two-view class CE + merged cosine invariance",
             "adversarial": "single conditional projection PatchGAN",
             "ltc": "local residual/contrast/Haar batch moments; no pixel matching",
-            "sfm": "native pre-classifier embedding cosine/moments + D feature moments",
+            "sfm": ("condition-prototype whitened sliced-Wasserstein set matching "
+                    "+ prototype anchor + D feature moments"
+                    if args.sfm_mode == "conditional_set_ot" else
+                    "native pre-classifier embedding cosine/moments + D feature moments"),
             "geometry": "frozen native band/polarization/depression/azimuth heads",
         },
+        "sfm_prototype_cache": (str(sfm_prototype_cache)
+                                 if sfm_prototype_cache is not None else None),
+        "sfm_prototype_signature": sfm_cache_signature,
         "gradient_routes": {
             "native_gradient_mode": args.native_gradient_mode,
             "teacher_metrics": "always evaluated; mode only changes E/G gradients",
@@ -442,6 +633,7 @@ def main() -> None:
             depression = batch["depression"].to(device, non_blocking=True)
             azimuth = batch["azimuth"].to(device, non_blocking=True)
             condition = condition_from_batch(meta, depression)
+            group_code = condition_group_code(labels, meta, depression)
             real = batch["roi"].to(device, non_blocking=True)
             real_d = differentiable_augment(real)
             spatial_noise = torch.randn(len(real), 1, 64, 64, device=device)
@@ -491,8 +683,8 @@ def main() -> None:
                 adversarial = -fake_score.mean()
                 rgb_loss = rgb_identity_loss(
                     rgb_logits, alt_logits, identity, alt_identity, labels)
-                ltc = local_texture_contrast_loss(
-                    differentiable_augment(fake), real_d)
+                fake_for_ltc = differentiable_augment(fake)
+                ltc = local_texture_contrast_loss(fake_for_ltc, real_d)
 
             # Keep the frozen native teacher in FP32.  Its parameters are never
             # trainable, while the selected route controls whether the fake
@@ -514,10 +706,23 @@ def main() -> None:
                 with torch.no_grad():
                     _, real_teacher_feature = teacher(
                         ((real.float() + 1.0) * .5).clamp(0, 1), return_features=True)
-                sfm = semantic_feature_mapping_loss(
-                    fake_teacher_feature, real_teacher_feature,
-                    fake_d_feature.float(), real_d_feature.float(),
-                    teacher_gradient=teacher_embedding_gradient)
+                if args.sfm_mode == "conditional_set_ot":
+                    sfm = conditional_set_sfm_loss(
+                        fake_teacher_feature, real_teacher_feature,
+                        local_texture_signature(fake_for_ltc.float()),
+                        local_texture_signature(real_d.float()).detach(),
+                        group_code, group_code, prototype_bank,
+                        fake_d_feature.float(), real_d_feature.float(),
+                        teacher_gradient=teacher_embedding_gradient,
+                        projection_count=args.sfm_projection_count,
+                        ltc_weight=args.sfm_ltc_cost_weight,
+                        anchor_weight=args.sfm_anchor_weight,
+                        ddp_global_set=distributed)
+                else:
+                    sfm = semantic_feature_mapping_loss(
+                        fake_teacher_feature, real_teacher_feature,
+                        fake_d_feature.float(), real_d_feature.float(),
+                        teacher_gradient=teacher_embedding_gradient)
                 geometry, geometry_terms = geometry_auxiliary_loss(
                     teacher, fake.float(), meta.float(), depression, azimuth,
                     teacher_gradient=geometry_gradient)
@@ -587,6 +792,7 @@ def main() -> None:
                 meta = batch["meta"].to(device)
                 depression = batch["depression"].to(device)
                 condition = condition_from_batch(meta, depression)
+                group_code = condition_group_code(labels, meta, depression)
                 real = batch["roi"].to(device)
                 identity, _, pyramid = ema_encoder(rgb, return_pyramid=True)
                 noise = torch.randn(len(real), 1, 64, 64, device=device)
@@ -598,9 +804,20 @@ def main() -> None:
                     ((fake + 1.0) * .5).clamp(0, 1), return_features=True)
                 _, real_teacher_feature = teacher(
                     ((real + 1.0) * .5).clamp(0, 1), return_features=True)
-                sfm = semantic_feature_mapping_loss(
-                    fake_teacher_feature, real_teacher_feature,
-                    fake_d_feature, real_d_feature)
+                if args.sfm_mode == "conditional_set_ot":
+                    sfm = conditional_set_sfm_loss(
+                        fake_teacher_feature, real_teacher_feature,
+                        local_texture_signature(fake),
+                        local_texture_signature(real_d),
+                        group_code, group_code, prototype_bank,
+                        fake_d_feature, real_d_feature,
+                        projection_count=args.sfm_projection_count,
+                        ltc_weight=args.sfm_ltc_cost_weight,
+                        anchor_weight=args.sfm_anchor_weight)
+                else:
+                    sfm = semantic_feature_mapping_loss(
+                        fake_teacher_feature, real_teacher_feature,
+                        fake_d_feature, real_d_feature)
                 geometry, _ = geometry_auxiliary_loss(
                     teacher, fake, meta, depression, batch["azimuth"].to(device))
                 ltc = local_texture_contrast_loss(fake, real_d)
@@ -649,7 +866,8 @@ def main() -> None:
                 csv.writer(handle).writerow(row)
             state = checkpoint_state(
                 epoch, encoder, generator, discriminator, ema_encoder, ema_generator,
-                generator_optimizer, discriminator_optimizer, validation, args)
+                generator_optimizer, discriminator_optimizer, validation, args,
+                sfm_prototype_cache)
             torch.save(state, args.output / "latest.pt")
             if epoch % 10 == 0 or epoch == args.epochs:
                 torch.save(state, args.output / f"epoch_{epoch:03d}.pt")
