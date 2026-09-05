@@ -88,18 +88,23 @@ class GeneratedConditionDataset(Dataset):
 
     def __init__(self, rgb_root: Path, sar_root: Path, rgb_size: int = 128,
                  include_style_roi: bool = False, band: str = "X",
-                 polarization: str = "HH", depression: str = "all") -> None:
+                 polarization: str = "HH", depression: str = "all",
+                 condition_sampler: str = "record",
+                 condition_sampler_seed: int = 20260830) -> None:
         self.include_style_roi = include_style_roi
         self.band, self.polarization, self.depression = band, polarization, depression
         self.base = JointROIDataset(rgb_root, sar_root, rgb_size=rgb_size, epoch_size=0,
                                    band=band, polarization=polarization, depression=depression,
-                                   augment_rgb=False, source_view_mode="random")
+                                   augment_rgb=False, source_view_mode="random",
+                                   condition_sampler=condition_sampler,
+                                   condition_sampler_seed=condition_sampler_seed)
 
     def __len__(self) -> int:
         return len(self.base.records)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        tif, _, class_name, bbox, meta, _ = self.base.records[index]
+        record_index = self.base._sample_record_index(index)
+        tif, _, class_name, bbox, meta, _ = self.base.records[record_index]
         source_angle = random.choice(self.base.class_rgb_angles[class_name])
         rgb = self.base._rgb(self.base.rgb_paths[class_name, source_angle])
         targets = torch.tensor((self.base.class_to_id[class_name],
@@ -258,6 +263,12 @@ def main() -> None:
     parser.add_argument("--steps-per-epoch", type=int, default=0,
                         help=("optional fixed optimizer updates per epoch; useful for "
                               "compute-matched real/generated comparisons"))
+    parser.add_argument("--condition-sampler",
+                        choices=("record", "class_uniform", "domain_uniform", "support_uniform"),
+                        default="record",
+                        help=("sampling distribution for generated classifier conditions; "
+                              "domain_uniform balances class and shared band/polarization/depression domains"))
+    parser.add_argument("--condition-sampler-seed", type=int, default=20260830)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--weight-decay", type=float, default=2e-4)
@@ -301,6 +312,8 @@ def main() -> None:
             raise ValueError("--meta-probe must omit --real-test-root so no real test is touched")
         if args.real_fraction != 0.0 or args.real_train_root is not None:
             raise ValueError("--meta-probe cannot mix real SAR pixels into its synthetic-only support")
+        if args.condition_sampler != "record":
+            raise ValueError("--meta-probe requires the registered record-frequency condition corpus")
     elif args.real_test_root is None:
         raise ValueError("normal classifier mode requires --real-test-root")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
@@ -371,7 +384,9 @@ def main() -> None:
         args.rgb_root, args.condition_root,
         include_style_roi=args.style_source == "posterior",
         band=args.train_band, polarization=args.train_polarization,
-        depression=args.train_depression)
+        depression=args.train_depression,
+        condition_sampler=args.condition_sampler,
+        condition_sampler_seed=args.condition_sampler_seed)
     manifest_path = None
     if args.meta_probe:
         manifest_path = args.generated_train_manifest or args.output / "generated_train_manifest.json"
@@ -627,6 +642,8 @@ def main() -> None:
         "real_train_samples": len(real_train) if real_train is not None else 0,
         "real_fraction": args.real_fraction,
         "real_batch_ratio": args.real_fraction,
+        "condition_sampler": args.condition_sampler,
+        "condition_sampler_seed": args.condition_sampler_seed,
         "synthetic_batch_size": synthetic_batch_size,
         "real_batch_size": real_batch_size,
         "real_test_samples": len(real_test) if real_test is not None else 0,
