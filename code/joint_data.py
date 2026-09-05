@@ -46,7 +46,8 @@ class JointROIDataset(Dataset):
                  band: str = "all", polarization: str = "all", depression: str = "all",
                  augment_rgb: bool = True, preload_rgb: bool = True,
                  source_view_mode: str = "nearest",
-                 return_all_views: bool = False, cache_dir: Path | None = None) -> None:
+                 return_all_views: bool = False, return_rgb_mask: bool = False,
+                 cache_dir: Path | None = None) -> None:
         self.rgb_root = Path(rgb_root)
         self.sar_root = Path(sar_root)
         self.rgb_size = rgb_size
@@ -54,6 +55,7 @@ class JointROIDataset(Dataset):
         self.pre_cropped = pre_cropped
         self.augment_rgb = augment_rgb
         self.return_all_views = return_all_views
+        self.return_rgb_mask = return_rgb_mask
         self.cache_dir = Path(cache_dir) if cache_dir is not None else Path(tempfile.gettempdir()) / "rgb2sar_cache"
         if source_view_mode not in {"nearest", "random", "mixed"}:
             raise ValueError("source_view_mode must be nearest, random, or mixed")
@@ -88,11 +90,14 @@ class JointROIDataset(Dataset):
         self.epoch_size = epoch_size or len(records)
         self.random_epoch = 0 < epoch_size < len(records)
         self._rgb_cache: dict[Path, torch.Tensor] = {}
+        self._rgb_mask_cache: dict[Path, torch.Tensor] = {}
         # Populate once in the parent process. DataLoader fork workers then
         # share these read-only base tensors via copy-on-write instead of each
         # worker decoding the same 466 PNG files independently.
         if preload_rgb:
             self._preload_rgb_cache(sorted(set(self.rgb_paths.values())))
+            if self.return_rgb_mask:
+                self._preload_rgb_mask_cache(sorted(set(self.rgb_paths.values())))
 
     def _record_cache_signature(self, band: str, polarization: str,
                                 depression: str) -> dict[str, object]:
@@ -200,6 +205,19 @@ class JointROIDataset(Dataset):
             tensor = image_tensor(rgba_to_rgb(image), self.rgb_size, True)
         return path, ((tensor + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
 
+    def _decode_rgb_mask_uint8(self, path: Path) -> tuple[Path, torch.Tensor]:
+        """Decode the source PNG alpha channel as a cached 0..255 mask.
+
+        RGB compositing intentionally remains unchanged for existing trainers.
+        The mask is an optional geometric signal for the unpaired bridge model;
+        images without an alpha channel are treated as fully foreground.
+        """
+        with Image.open(path) as image:
+            rgba = image.convert("RGBA")
+            alpha = rgba.getchannel("A")
+            tensor = image_tensor(alpha, self.rgb_size, False)
+        return path, ((tensor + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+
     def _preload_rgb_cache(self, paths: list[Path]) -> None:
         # The dataset may live under a non-ASCII or read-only mount. PyTorch's
         # zip writer needs an ASCII writable path, so keep derived cache data
@@ -230,6 +248,33 @@ class JointROIDataset(Dataset):
         torch.save(payload, temporary)
         temporary.replace(cache_file)
 
+    def _preload_rgb_mask_cache(self, paths: list[Path]) -> None:
+        source_hash = hashlib.sha256(str(self.rgb_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        cache_file = self.cache_dir / f"joint_rgb_mask_cache_{source_hash}_{self.rgb_size}.pt"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        signature = [(str(path.relative_to(self.rgb_root)), path.stat().st_size,
+                      path.stat().st_mtime_ns) for path in paths]
+        if cache_file.is_file():
+            try:
+                saved = torch.load(cache_file, map_location="cpu", weights_only=True)
+                if saved.get("signature") == signature:
+                    self._rgb_mask_cache = {self.rgb_root / name: tensor
+                                            for name, tensor in saved["masks"].items()}
+                    return
+            except Exception:
+                pass
+        print(f"building one-time RGB alpha-mask cache: {cache_file} ({len(paths)} images)",
+              flush=True)
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(paths)))) as executor:
+            for path, tensor in executor.map(self._decode_rgb_mask_uint8, paths):
+                self._rgb_mask_cache[path] = tensor
+        payload = {"signature": signature,
+                   "masks": {str(path.relative_to(self.rgb_root)): tensor
+                             for path, tensor in self._rgb_mask_cache.items()}}
+        temporary = cache_file.with_suffix(cache_file.suffix + ".tmp")
+        torch.save(payload, temporary)
+        temporary.replace(cache_file)
+
     def _rgb_base(self, path: Path) -> torch.Tensor:
         cached = self._rgb_cache.get(path)
         if cached is None:
@@ -246,6 +291,13 @@ class JointROIDataset(Dataset):
             noise = torch.randn_like(rgb) * random.uniform(0.0, 0.015)
             rgb = (rgb * gain + bias + noise).clamp(-1.0, 1.0)
         return rgb
+
+    def _rgb_mask(self, path: Path) -> torch.Tensor:
+        cached = self._rgb_mask_cache.get(path)
+        if cached is None:
+            _, cached = self._decode_rgb_mask_uint8(path)
+            self._rgb_mask_cache[path] = cached
+        return cached.float().div(255.0)
 
     def __getitem__(self, index: int) -> dict[str, object]:
         if self.random_epoch:
@@ -277,6 +329,11 @@ class JointROIDataset(Dataset):
             "rgb_path": str(rgb_path),
             "sar_path": str(tif),
         }
+        if self.return_rgb_mask:
+            item.update({
+                "rgb_mask": self._rgb_mask(rgb_path),
+                "rgb_alt_mask": self._rgb_mask(alternate_path),
+            })
         if self.return_all_views:
             # Keep the original 12-view convention (1.png=0°, ..., 12.png=330°)
             # without synthesising missing RGB views.  A fixed shape and mask
@@ -306,5 +363,6 @@ class JointROIDataset(Dataset):
             "rgb_naming": self.rgb_naming,
             "source_view_mode": self.source_view_mode,
             "return_all_views": self.return_all_views,
+            "return_rgb_mask": self.return_rgb_mask,
             "pre_cropped": self.pre_cropped,
         }

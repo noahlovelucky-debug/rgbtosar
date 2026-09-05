@@ -14,6 +14,56 @@
 - PatchGAN 判别器的真实性损失、特征匹配和 SAR 强度/边缘统计作为辅助项；生成器在
   前 10 轮输出无散斑结构，随后 5 轮逐步加入可微分乘性散斑，避免分类器利用棋盘格伪纹理。
 
+## HiFC 风格无像素配对入口
+
+论文公开了 HiFC-GAN 的方法，但没有找到作者公开的官方代码仓库。本项目新增了独立的
+`hifc_unpaired_conditioned_v1`：保留浅层 LTC 局部纹理对比和深层 SFM 语义映射，RGB 与
+SAR 只按车型建立弱语义关系，不做同坐标像素重建；目标 SAR 的方位、俯视角、波段和极化
+作为条件输入。完整架构、loss、梯度路径和运行命令见
+[`HIFC_UNPAIRED_ADAPTATION_ZH.md`](HIFC_UNPAIRED_ADAPTATION_ZH.md)。
+
+```bash
+DATA_ROOT=/data/newdata/A25_T37_down_大图/A02 \
+DEVICE=cuda:0 OUTPUT=runs/hifc_unpaired_all_conditions \
+bash run_hifc_unpaired_all.sh
+```
+
+代码入口：`hifc_unpaired_sar_gan.py`、`train_hifc_unpaired_sar_gan.py`、
+`render_hifc_unpaired_sar.py`；快速张量检查：`python test_hifc_unpaired_sar_gan.py`。
+
+## FACT-SAR 研究路线
+
+`FACT-SAR` 是与上述 HiFC 训练器分开的研究实现：它保留 HiFC 的生成器和条件判别器，
+但完全移除 native SAR 分类器到生成器的梯度，改为用冻结随机任务 learner 的因果训练影响
+匹配，直接约束“由生成 SAR 训练出的 learner 是否会像真实 SAR 一样更新”。完整数据隔离、
+公式、梯度路径和入口见 [`FACT_SAR.md`](FACT_SAR.md)。
+
+代码入口：`fact_sar.py`、`train_fact_sar_gan.py`、`test_fact_sar.py`。FACT checkpoint
+可直接由既有 `train_generated_sar_classifier_64.py` 做 generated-train / real-test TSTR，
+也可由 `render_hifc_unpaired_sar.py` 渲染。
+
+## 64x64 条件扩散 V2
+
+`conditional_sar_diffusion.py` 提供一个独立的 `rgb_identity_conditioned_sar_ddpm64_v2`。
+它不读取 HiFC/FACT checkpoint，也不使用 native SAR teacher、GAN 判别器或 RGB-SAR
+像素对齐。每个训练样本读取 128x128 RGB 主视图和同车型的另一 RGB 视图，以及一个
+64x64 SAR ROI。RGB encoder 对两个视图分别输出 token 和 40 类车型 logits；双视图交叉
+熵和 token 余弦一致性约束身份，平均 soft class posterior 与 12 维成像条件（方位
+sin/cos、俯视角、波段、极化）共同进入每个 U-Net residual block 的 FiLM。扩散网络使用
+v-prediction，唯一总目标为：
+
+```text
+L = L_v + 0.1 * (0.5 * CE(rgb, class) + 0.5 * CE(rgb_alt, class)
+                 + 0.25 * (1 - cosine(z_rgb, z_rgb_alt)))
+```
+
+训练入口是 `train_conditional_sar_diffusion.py`，8 卡启动脚本是
+`run_conditional_sar_diffusion_v2_8gpu.sh`，渲染入口是
+`render_conditional_sar_diffusion.py`。该路线只证明无像素配对条件扩散能否学习车型和
+成像条件；下游 TSTR 仍需使用独立的真实 X/HH 测试集评估，不能用 RGB identity accuracy
+替代。旧 `rgb_conditioned_sar_ddpm64_v1` checkpoint 仍可由 renderer 兼容读取，但它使用
+epsilon-prediction 且没有 RGB 身份监督。
+
 ## 1. RGB_15 已暂停
 
 当前联合训练直接读取原始 `RGB`，约定 `1.png=0°、2.png=30°、...、12.png=330°`；
@@ -163,3 +213,45 @@ python render_continuous_spatial_sar.py \
   --class-name Buick_GL8 --source-angle 0 \
   --target-angles "7.5,22.5,37.5,52.5" --output runs/interpolated_azimuths.png
 ```
+
+## 64x64 条件扩散 V2 全量结果（2026-09-05）
+
+`conditional_sar_diffusion.py` 中的 `rgb_identity_conditioned_sar_ddpm64_v2` 是从随机
+初始化开始的独立扩散基线，不是从 HiFC 或旧 DDPM checkpoint 微调。训练使用 8 卡 DDP，
+40 类、X/KU、HH/HV/VH/VV、15/30/45/60 度全部条件，global batch=64、每 epoch
+24000 个样本、120 epoch。RGB 输入为 128x128，SAR 目标为 64x64；RGB 主视图和同车型
+另一视图只用于身份编码器，RGB 与 SAR 不做像素配准。
+
+V2 的变化是：RGB 双视图身份编码器、40 类辅助 CE、视图 token cosine 一致性、独立的
+采集条件 MLP、每个 U-Net 残差块的 time/RGB/acquisition 融合 FiLM、v-prediction、
+condition dropout=0.1、EMA=0.999 和 CFG=1.5。训练目标只有
+`L = L_v + 0.1 * (0.5*CE(view1) + 0.5*CE(view2) + 0.25*(1-cos(z1,z2)))`，
+没有 native SAR 分类器、GAN、像素级 RGB-SAR 对齐或 TSTR 超梯度。
+
+全量输出目录为 `runs/conditional_ddpm64_identity_v2_full_20260905/`，最终权重为
+`epoch_120.pt`，配置为 `config.json`，训练曲线为 `history.csv`，预览为
+`preview_120.png`，固定初始噪声的 0--330 度 sweep 为
+`azimuth_sweep_buick_gl8_x_hh_d30_shared_noise_100steps.png`。最终一轮记录
+`v_mse=0.0754918`、`identity_loss=3.3184e-5`、RGB identity accuracy=100%。
+
+用同一初始噪声、100 步 DDIM、CFG=1.5 做条件敏感度审计，epoch 120 的角度平均绝对
+差异/输出标准差为 **0.529**，六个车型的平均两两差异/输出标准差为 **0.327**；旧
+`rgb_conditioned_sar_ddpm64_v1` 约为 0.014/0.024，V2 20 epoch 短跑约为 0.280/0.219。
+因此 V2 已不再完全忽略方位角和车型条件，但 `preview_120.png` 与 sweep 仍主要表现为
+稀疏散射亮斑，车辆轮廓和类别细节明显弱于 HiFC 的 `rgb_to_sar_visualization.png`。
+本次结果证明的是“条件使用得到改善”，不能据此宣称已经达到 HiFC 的视觉质量或
+TSTR 泛化；后续若追求论文级效果，需要增加能表达 SAR 几何/散射结构的非配对语义约束，
+而不是继续堆叠分类器损失。
+
+## UNSB-SAR 轮廓条件无配对桥接扩散（新主线）
+
+针对 V2 从纯高斯噪声起步、轮廓弱和 native classifier shortcut 的问题，新增了
+UNSB-inspired 的无配对随机桥实现：alpha soft-silhouette 作为 64x64 源端点，RGB
+身份 token、64/32/16/8 多尺度轮廓控制和连续采集条件共同驱动 SAR bridge；训练核心
+为条件投影 PatchD、SB energy 和结构 PatchNCE，不加载 native SAR 分类器，也不使用
+RGB/SAR 像素级 L1。实现、流程、loss、梯度归属、复现实验命令和评测门槛见
+[`UNSB_SAR_BRIDGE.md`](UNSB_SAR_BRIDGE.md)。
+
+新增入口为 `unsb_sar_bridge.py`、`train_conditional_sar_unsb.py`、
+`render_unsb_sar_bridge.py` 和 `test_unsb_sar_bridge.py`；官方 UNSB 参考代码固定在
+`external/UNSB/`，现有 V2 与 HiFC 训练文件保持不变。

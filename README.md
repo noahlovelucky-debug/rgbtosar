@@ -183,6 +183,7 @@ python infer.py --checkpoint runs\angle_a\latest.pt --input "Z:\amplitude 8-bit 
 CPU 链路验证可在训练命令后加 `--tiny --image-size 64 --epoch-size 8 --epochs 1 --batch-size 1`。正式实验建议先固定成像条件，例如 `--band X --polarization HH --depression 30`，否则生成器还要同时拟合波段、极化和俯视角差异。
 
 当前实现是“同车型、同方向域”的生成，并非同一次观测的物理严格重建。后续可训练 12 个模型，或把角度编码加入单一条件生成器。
+
 ## 当前主线：连续方位角 + 四俯视角的空间条件 ROI SAR 生成
 
 本阶段固定 **X/HH**，不再只训练/验证 30° 俯视角。训练集同时包含 15°、30°、45°、60°，目标方位角以 `sin/cos` 连续条件输入；训练时对相邻 5° 方位角施加低频连续性约束，因此可渲染 7.5°、22.5° 等训练集中没有的方位角。极化和波段暂不扩展。
@@ -203,3 +204,22 @@ python render_continuous_spatial_sar.py \
   --class-name Buick_GL8 --source-angle 0 \
   --target-angles "7.5,22.5,37.5,52.5" --output runs/interpolated_azimuths.png
 ```
+
+## UNSB-inspired 64x64 bridge experiment (2026-09-05)
+
+本次新增了一条独立的无像素配对 RGB -> SAR bridge 路线。代码、复现命令和完整的中文
+模型说明见 [`code/UNSB_SAR_BRIDGE.md`](code/UNSB_SAR_BRIDGE.md)。主要入口是
+[`code/train_conditional_sar_unsb.py`](code/train_conditional_sar_unsb.py)，独立 TSTR
+验证入口是 [`code/train_generated_sar_classifier_unsb.py`](code/train_generated_sar_classifier_unsb.py)。
+
+全条件训练使用 40 类、all band、all polarization、15/30/45/60 度，global batch 64，
+120 epochs。最终 checkpoint 约 414 MB，未提交到 GitHub；配置和曲线保存在
+[`results/unsb_sar_full_20260905/`](results/unsb_sar_full_20260905/)。
+
+独立 X/HH TSTR（生成图训练、真实 X/HH test 测试）得到 Top-1 **15.93%**、Top-5
+**38.95%**、方位 Top-1 **17.32%**、方位 circular MAE **89.61°**。这说明该版本
+能产生 SAR-like 纹理，但车型/方位跨域迁移弱，不能把 RGB identity accuracy=100%
+当成 SAR 信息已正确学习；该结果作为负基线和后续研究对照。
+
+可视化：[epoch 120 preview](results/unsb_sar_full_20260905/visuals/preview_120.png)、
+[Buick GL8 angle sweep](results/unsb_sar_full_20260905/visuals/angle_sweep_buick_gl8.png)。

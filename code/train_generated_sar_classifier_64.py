@@ -3,8 +3,9 @@
 Real train TIFF pixel values are never passed to the classifier.  They provide
 only the legal observation condition (class, X/HH, depression, azimuth) used
 to ask the frozen GAN for a synthetic training image.  The normal mode
-evaluates on held-out X/HH TIFFs; ``--meta-probe`` intentionally disables that
-evaluation and emits the registered synthetic-only MT1 probe artifact.
+evaluates on a selected held-out real acquisition domain; ``--meta-probe``
+intentionally disables that evaluation and emits the registered synthetic-only
+MT1 probe artifact.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ from tqdm import tqdm
 
 from bbox_data import image_tensor, metadata_vector, read_annotation
 from dual_component_sar_gan import LargeRGBIdentityEncoder
+from fact_sar import FACT_ARCHITECTURE
 from hifc_unpaired_sar_gan import HIFC_ARCHITECTURE, HIFCUnpairedGenerator, condition_from_batch
 from joint_data import JointROIDataset
 from joint_models import (CodebookSpatialROIGenerator, RGBIdentityEncoder, SARStyleEncoder,
@@ -113,21 +115,31 @@ class GeneratedConditionDataset(Dataset):
         return rgb, metadata_vector(meta, bbox), torch.tensor(source_angle, dtype=torch.long), targets, style_roi
 
 
-class RealXHHTestDataset(Dataset):
-    """Real 64x64 X/HH ROI test images and metadata labels."""
+class RealConditionTestDataset(Dataset):
+    """Real 64x64 SAR ROIs from one held-out band/polarisation condition."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, band: str = "X", polarization: str = "HH",
+                 depression: str = "all") -> None:
+        if band not in BAND_TO_ID:
+            raise ValueError(f"unsupported test band: {band}")
+        if polarization not in POLARIZATION_TO_ID:
+            raise ValueError(f"unsupported test polarisation: {polarization}")
+        if depression not in {"all", *(str(value) for value in DEPRESSION_TO_ID)}:
+            raise ValueError(f"unsupported test depression: {depression}")
+        self.band, self.polarization, self.depression = band, polarization, depression
         self.records: list[tuple[Path, int, int, int]] = []
         for class_id, class_name in enumerate(SOC40_CLASSES):
-            for path in sorted((Path(root) / class_name).glob("X_HH_*.tif")):
+            for path in sorted((Path(root) / class_name).glob(f"{band}_{polarization}_*.tif")):
                 try:
                     _, meta = read_annotation(path.with_suffix(".xml"))
                 except Exception:
                     continue
+                if depression != "all" and int(meta["depression"]) != int(depression):
+                    continue
                 self.records.append((path, class_id, DEPRESSION_TO_ID[int(meta["depression"])],
                                      ((int(meta["azimuth"]) + 15) % 360) // 30))
         if not self.records:
-            raise RuntimeError(f"no X/HH TIFFs under {root}")
+            raise RuntimeError(f"no {band}/{polarization} TIFFs under {root}")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -136,7 +148,15 @@ class RealXHHTestDataset(Dataset):
         path, class_id, depression, azimuth = self.records[index]
         with Image.open(path) as image:
             roi = image_tensor(image, 64, False).add(1).mul(.5)
-        return roi, torch.tensor((class_id, 0, 0, depression, azimuth), dtype=torch.long)
+        return roi, torch.tensor((class_id, BAND_TO_ID[self.band], POLARIZATION_TO_ID[self.polarization],
+                                  depression, azimuth), dtype=torch.long)
+
+
+class RealXHHTestDataset(RealConditionTestDataset):
+    """Backward-compatible default held-out X/HH test dataset."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root, band="X", polarization="HH", depression="all")
 
 
 def augment(image: torch.Tensor) -> torch.Tensor:
@@ -179,7 +199,7 @@ def evaluate(model: SARClassifier64, loader: DataLoader, device: torch.device) -
     model.eval(); total = correct = top5 = azimuth_correct = 0; azimuth_error = 0.0; loss_sum = 0.0
     criterion = nn.CrossEntropyLoss(); by_depression: dict[int, list[int]] = defaultdict(lambda: [0, 0])
     with torch.inference_mode():
-        for image, targets in tqdm(loader, desc="real X/HH classifier test", leave=False):
+        for image, targets in tqdm(loader, desc="real SAR classifier test", leave=False):
             image, targets = image.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             logits, features = model(image, return_features=True)
             labels = targets[:, 0]; prediction = logits.argmax(1)
@@ -210,8 +230,10 @@ def main() -> None:
     parser.add_argument("--rgb-root", type=Path, required=True)
     parser.add_argument("--condition-root", type=Path, required=True, help="real SAR train root; metadata only")
     parser.add_argument("--real-test-root", type=Path,
-                        help="held-out X/HH root; omitted by the synthetic-only meta-probe mode")
+                        help="held-out real SAR root; omitted by the synthetic-only meta-probe mode")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resume-classifier-checkpoint", type=Path,
+                        help="resume classifier weights/state from a previous latest.pt")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--checkpoint-selection", choices=("final", "real_test_legacy"), default="final",
                         help="select the final fixed epoch (default) or reproduce the old test-set selection")
@@ -222,6 +244,12 @@ def main() -> None:
                         help="polarization conditions used for real and generated classifier training")
     parser.add_argument("--train-depression", choices=("all", "15", "30", "45", "60"), default="all",
                         help="depression conditions used for real and generated classifier training")
+    parser.add_argument("--test-band", choices=("X", "KU"), default="X",
+                        help="held-out real SAR band used for evaluation")
+    parser.add_argument("--test-polarization", choices=("HH", "HV", "VH", "VV"), default="HH",
+                        help="held-out real SAR polarisation used for evaluation")
+    parser.add_argument("--test-depression", choices=("all", "15", "30", "45", "60"), default="all",
+                        help="held-out real SAR depression used for evaluation")
     parser.add_argument("--real-train-root", type=Path,
                         help="optional real SAR train root to mix with generated samples")
     parser.add_argument("--real-fraction", type=float, default=0.0,
@@ -266,6 +294,8 @@ def main() -> None:
             raise ValueError("--meta-probe cannot use a real-ROI posterior style")
         if (args.train_band, args.train_polarization, args.train_depression) != ("X", "HH", "all"):
             raise ValueError("--meta-probe requires the registered X/HH/all condition corpus")
+        if (args.test_band, args.test_polarization, args.test_depression) != ("X", "HH", "all"):
+            raise ValueError("--meta-probe does not permit a held-out test condition")
         if args.real_test_root is not None:
             raise ValueError("--meta-probe must omit --real-test-root so no real test is touched")
         if args.real_fraction != 0.0 or args.real_train_root is not None:
@@ -274,15 +304,21 @@ def main() -> None:
         raise ValueError("normal classifier mode requires --real-test-root")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     device = torch.device(args.device); args.output.mkdir(parents=True, exist_ok=True)
+    if args.resume_classifier_checkpoint is not None and not args.resume_classifier_checkpoint.is_file():
+        raise FileNotFoundError(f"classifier resume checkpoint not found: {args.resume_classifier_checkpoint}")
 
     state = torch.load(args.gan_checkpoint, map_location=device, weights_only=False)
     architecture = state.get("architecture")
     if architecture not in {"continuous_spatial_v1", "continuous_spatial_v1_ablation",
                             "continuous_spatial_style_v2",
-                            "continuous_spatial_codebook_v3", HIFC_ARCHITECTURE} \
+                            "continuous_spatial_codebook_v3", HIFC_ARCHITECTURE,
+                            FACT_ARCHITECTURE} \
             or state.get("classes") != list(SOC40_CLASSES):
         raise RuntimeError("expected a supported SOC40 GAN checkpoint")
-    is_hifc = architecture == HIFC_ARCHITECTURE
+    # FACT keeps the HiFC generator/condition interface but changes the
+    # supervision route.  Treat it as HiFC at inference time so the standard
+    # generated-to-real classifier protocol remains exactly comparable.
+    is_hifc = architecture in {HIFC_ARCHITECTURE, FACT_ARCHITECTURE}
     encoder = (LargeRGBIdentityEncoder(len(SOC40_CLASSES)) if is_hifc
                else RGBIdentityEncoder(len(SOC40_CLASSES))).to(device)
     if is_hifc:
@@ -339,7 +375,9 @@ def main() -> None:
     if args.meta_probe:
         manifest_path = args.generated_train_manifest or args.output / "generated_train_manifest.json"
         ensure_generated_train_manifest(generated_train, manifest_path)
-    real_test = None if args.meta_probe else RealXHHTestDataset(args.real_test_root)
+    real_test = None if args.meta_probe else RealConditionTestDataset(
+        args.real_test_root, band=args.test_band, polarization=args.test_polarization,
+        depression=args.test_depression)
     real_train = None
     if args.real_fraction > 0.0:
         real_train = SARImageDataset(
@@ -372,12 +410,41 @@ def main() -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda" and not args.no_amp)
     class_loss, aux_loss = nn.CrossEntropyLoss(label_smoothing=.03), nn.CrossEntropyLoss()
     history = args.output / "history.csv"
-    with history.open("w", newline="", encoding="utf-8") as handle:
-        csv.writer(handle).writerow(("epoch", "mixed_train_loss", "mixed_train_top1", "synthetic_train_top1",
-                                     "real_train_top1", "real_test_loss", "real_test_top1", "real_test_top5", "lr"))
+    start_epoch = 1
+    resume_state = None
+    if args.resume_classifier_checkpoint is not None:
+        resume_state = torch.load(args.resume_classifier_checkpoint, map_location=device, weights_only=False)
+        if "model" not in resume_state or "epoch" not in resume_state:
+            raise RuntimeError("classifier resume checkpoint must contain model and epoch")
+        classifier.load_state_dict(resume_state["model"])
+        start_epoch = int(resume_state["epoch"]) + 1
+        if start_epoch > args.epochs:
+            raise ValueError(
+                f"resume checkpoint is already at epoch {start_epoch - 1}, beyond requested {args.epochs}"
+            )
+        if "optimizer" in resume_state:
+            optimizer.load_state_dict(resume_state["optimizer"])
+        if "scheduler" in resume_state:
+            scheduler.load_state_dict(resume_state["scheduler"])
+        else:
+            # Old checkpoints did not persist optimizer/scheduler state.  Put
+            # the fresh scheduler at the same epoch before continuing.
+            scheduler.step(start_epoch - 1)
+        if "scaler" in resume_state:
+            scaler.load_state_dict(resume_state["scaler"])
+        if "torch_rng_state" in resume_state:
+            torch.set_rng_state(resume_state["torch_rng_state"])
+        if "numpy_rng_state" in resume_state:
+            np.random.set_state(resume_state["numpy_rng_state"])
+        if "python_rng_state" in resume_state:
+            random.setstate(resume_state["python_rng_state"])
+    if not (args.resume_classifier_checkpoint is not None and history.is_file()):
+        with history.open("w", newline="", encoding="utf-8") as handle:
+            csv.writer(handle).writerow(("epoch", "mixed_train_loss", "mixed_train_top1", "synthetic_train_top1",
+                                         "real_train_top1", "real_test_loss", "real_test_top1", "real_test_top5", "lr"))
     best = -1.0
     saved_examples = 0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         classifier.train(); loss_sum = correct = total = 0
         synthetic_correct = synthetic_total = real_correct = real_total = 0
         real_iterator = iter(real_loader) if real_loader is not None else None
@@ -482,6 +549,9 @@ def main() -> None:
         scheduler.step()
         saved = {"model": classifier.state_dict(), "epoch": epoch, "classes": list(SOC40_CLASSES), "input_size": 64,
                  "metrics": metrics, "gan_checkpoint": str(args.gan_checkpoint),
+                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                 "scaler": scaler.state_dict(), "torch_rng_state": torch.get_rng_state(),
+                 "numpy_rng_state": np.random.get_state(), "python_rng_state": random.getstate(),
                  "training_source": (
                      "frozen GAN samples plus real train pixels"
                      if real_train is not None else "frozen GAN samples only"),
@@ -489,7 +559,10 @@ def main() -> None:
                  "real_train_root": str(args.real_train_root) if args.real_train_root is not None else None,
                  "train_band": args.train_band,
                  "train_polarization": args.train_polarization,
-                 "train_depression": args.train_depression}
+                 "train_depression": args.train_depression,
+                 "test_band": args.test_band,
+                 "test_polarization": args.test_polarization,
+                 "test_depression": args.test_depression}
         if args.meta_probe:
             assert manifest_path is not None
             saved["meta_probe_metadata"] = {
@@ -528,11 +601,16 @@ def main() -> None:
         "steps_per_epoch": (args.steps_per_epoch or len(train_loader)),
         "real_train_samples": len(real_train) if real_train is not None else 0,
         "real_fraction": args.real_fraction,
+        "synthetic_batch_size": synthetic_batch_size,
+        "real_batch_size": real_batch_size,
         "real_test_samples": len(real_test) if real_test is not None else 0,
         "checkpoint_selection": args.checkpoint_selection,
         "train_band": args.train_band,
         "train_polarization": args.train_polarization,
         "train_depression": args.train_depression,
+        "test_band": args.test_band,
+        "test_polarization": args.test_polarization,
+        "test_depression": args.test_depression,
         "training_policy": (
             "classifier sees generated pixels only; generator samples a frozen empirical spatial-code prior "
             "learned from real train SAR" if architecture == "continuous_spatial_codebook_v3" else

@@ -302,11 +302,16 @@ class ContinuousROIDiscriminator(ROIDiscriminator):
     class loss without introducing a separate classifier backbone.
     """
 
-    def __init__(self, meta_dim: int = 12, base: int = 32, classes: int = 40) -> None:
+    def __init__(self, meta_dim: int = 12, base: int = 32, classes: int = 40,
+                 class_pool: str = "mean") -> None:
         super().__init__(base=base)
         self.condition = nn.Sequential(nn.Linear(meta_dim, base * 8), nn.SiLU(), nn.Linear(base * 8, base * 8))
         self.classes = classes
-        self.classifier = nn.Linear(base * 8, classes)
+        if class_pool not in {"mean", "mean_max"}:
+            raise ValueError(f"unsupported class pooling mode: {class_pool}")
+        self.class_pool = class_pool
+        pooled_channels = base * 8 * (2 if class_pool == "mean_max" else 1)
+        self.classifier = nn.Linear(pooled_channels, classes)
         # D0 must be numerically equivalent to the archived V1 discriminator.
         nn.init.zeros_(self.classifier.weight)
         nn.init.zeros_(self.classifier.bias)
@@ -318,6 +323,8 @@ class ContinuousROIDiscriminator(ROIDiscriminator):
         score = (self.score(features) + projection).flatten(1)
         if return_class_logits:
             pooled = features.mean((2, 3))
+            if self.class_pool == "mean_max":
+                pooled = torch.cat((pooled, features.amax((2, 3))), dim=1)
             return score, features, self.classifier(pooled)
         return score, features
 

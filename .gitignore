@@ -15,3 +15,6 @@ runs/
 server_results/
 *.log
 .joint_rgb_cache_*.pt
+*.safetensors
+**/runs/
+.pytest_cache/
