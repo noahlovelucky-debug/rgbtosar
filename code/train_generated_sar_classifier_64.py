@@ -253,7 +253,8 @@ def main() -> None:
     parser.add_argument("--real-train-root", type=Path,
                         help="optional real SAR train root to mix with generated samples")
     parser.add_argument("--real-fraction", type=float, default=0.0,
-                        help="fraction of each classifier batch drawn from real X/HH train ROIs")
+                        help=("fraction of each classifier batch drawn from real train ROIs; "
+                              "this is a batch ratio, not a real-dataset shot fraction"))
     parser.add_argument("--steps-per-epoch", type=int, default=0,
                         help=("optional fixed optimizer updates per epoch; useful for "
                               "compute-matched real/generated comparisons"))
@@ -274,8 +275,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=415)
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
-    if not 0.0 <= args.real_fraction < 1.0:
-        raise ValueError("--real-fraction must be in [0, 1)")
+    if not 0.0 <= args.real_fraction <= 1.0:
+        raise ValueError("--real-fraction must be in [0, 1]")
     if args.steps_per_epoch < 0:
         raise ValueError("--steps-per-epoch must be non-negative")
     if args.real_fraction > 0.0 and args.real_train_root is None:
@@ -384,21 +385,31 @@ def main() -> None:
             args.real_train_root, train=True,
             band=args.train_band, polarization=args.train_polarization,
             depression=args.train_depression)
-        synthetic_batch_size = max(1, int(round(args.batch_size * (1.0 - args.real_fraction))))
-        real_batch_size = args.batch_size - synthetic_batch_size
-        if real_batch_size < 1:
-            raise ValueError("real-fraction leaves no generated samples in a classifier batch")
-    else:
-        synthetic_batch_size = args.batch_size
-        real_batch_size = 0
-    train_loader = DataLoader(
+    synthetic_batch_size = int(round(args.batch_size * (1.0 - args.real_fraction)))
+    real_batch_size = args.batch_size - synthetic_batch_size
+    if synthetic_batch_size < 0 or real_batch_size < 0 or synthetic_batch_size + real_batch_size != args.batch_size:
+        raise ValueError("invalid real-fraction batch split")
+    if synthetic_batch_size == 0 and real_train is None:
+        raise ValueError("a pure-real classifier run requires --real-train-root")
+    train_loader = (DataLoader(
         generated_train, synthetic_batch_size, shuffle=True, num_workers=args.workers,
-        drop_last=real_train is not None,
-        pin_memory=device.type == "cuda", persistent_workers=args.workers > 0)
+        drop_last=True, pin_memory=device.type == "cuda",
+        persistent_workers=args.workers > 0) if synthetic_batch_size else None)
     real_loader = (DataLoader(
         real_train, real_batch_size, shuffle=True, num_workers=args.workers, drop_last=True,
         pin_memory=device.type == "cuda", persistent_workers=args.workers > 0)
-                   if real_train is not None else None)
+                   if real_train is not None and real_batch_size else None)
+    if args.steps_per_epoch:
+        steps_per_epoch = args.steps_per_epoch
+    else:
+        loader_lengths = []
+        if train_loader is not None:
+            loader_lengths.append(len(train_loader))
+        if real_loader is not None:
+            loader_lengths.append(len(real_loader))
+        steps_per_epoch = max(loader_lengths, default=0)
+    if steps_per_epoch <= 0:
+        raise ValueError("no classifier training batches are available")
     test_loader = (DataLoader(real_test, args.batch_size * 2, shuffle=False, num_workers=args.workers,
                               pin_memory=device.type == "cuda", persistent_workers=args.workers > 0)
                    if real_test is not None else None)
@@ -444,75 +455,86 @@ def main() -> None:
                                          "real_train_top1", "real_test_loss", "real_test_top1", "real_test_top5", "lr"))
     best = -1.0
     saved_examples = 0
+    def cycle(loader):
+        while loader is not None:
+            yielded = False
+            for batch in loader:
+                yielded = True
+                yield batch
+            if not yielded:
+                raise RuntimeError("classifier DataLoader produced no batches")
+
     for epoch in range(start_epoch, args.epochs + 1):
         classifier.train(); loss_sum = correct = total = 0
         synthetic_correct = synthetic_total = real_correct = real_total = 0
-        real_iterator = iter(real_loader) if real_loader is not None else None
-        for batch_index, (rgb, meta, source_angle, targets, style_roi) in enumerate(tqdm(
-                train_loader, desc=f"synthetic SAR classifier {epoch}/{args.epochs}")):
-            rgb, meta = rgb.to(device, non_blocking=True), meta.to(device, non_blocking=True)
-            source_angle, targets = source_angle.to(device, non_blocking=True), targets.to(device, non_blocking=True)
-            with torch.inference_mode():
-                identity, _, pyramid = encoder(rgb, return_pyramid=True)
-                if is_hifc:
-                    # HiFC uses only target SAR acquisition metadata.  The
-                    # classifier's depression target is an ID in 0..3.
-                    depression = (targets[:, 3] + 1).mul(15)
-                    condition = condition_from_batch(meta, depression)
-                    synthetic = generator(identity, condition, pyramid)[2]
-                else:
-                    condition = gan_condition(meta, source_angle)
-                if architecture == "continuous_spatial_codebook_v3":
-                    assert latent_codes is not None and code_lookup is not None
-                    keys = zip(targets[:, 0].tolist(), targets[:, 3].tolist(),
-                               targets[:, 4].tolist())
-                    selected = []
-                    for key in keys:
-                        candidates = code_lookup[tuple(map(int, key))]
-                        if not candidates:
-                            raise RuntimeError(f"no spatial SAR code for condition {key}")
-                        selected.append(random.choice(candidates))
-                    code_index = torch.tensor(selected, device=device)
-                    code = latent_codes[code_index].float()
-                    synthetic = generator(identity, condition, pyramid, code, apply_speckle=True)
-                elif architecture == "continuous_spatial_style_v2":
-                    if args.style_source == "posterior":
-                        assert style_encoder is not None
-                        _, style, _ = style_encoder(style_roi.to(device, non_blocking=True), sample=False)
+        synthetic_iterator = cycle(train_loader)
+        real_iterator = cycle(real_loader)
+        for batch_index in range(steps_per_epoch):
+            synthetic = None; targets = None
+            if train_loader is not None:
+                rgb, meta, source_angle, targets, style_roi = next(synthetic_iterator)
+                rgb, meta = rgb.to(device, non_blocking=True), meta.to(device, non_blocking=True)
+                source_angle, targets = source_angle.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+                with torch.inference_mode():
+                    identity, _, pyramid = encoder(rgb, return_pyramid=True)
+                    if is_hifc:
+                        # HiFC uses only target SAR acquisition metadata.  The
+                        # classifier's depression target is an ID in 0..3.
+                        depression = (targets[:, 3] + 1).mul(15)
+                        condition = condition_from_batch(meta, depression)
+                        synthetic = generator(identity, condition, pyramid)[2]
                     else:
-                        noise = torch.randn(len(rgb), int(state["style_dim"]), device=device)
-                        style = noise
-                    if args.style_source == "prior" and "style_prior_mean" in state and "style_prior_cholesky" in state:
-                        depression = targets[:, 3]
-                        prior_mean = state["style_prior_mean"].to(device)
-                        prior_factor = state["style_prior_cholesky"].to(device)
-                        if prior_mean.ndim == 3:
-                            mean = prior_mean[targets[:, 0], depression]
-                            factor = prior_factor[targets[:, 0], depression]
+                        condition = gan_condition(meta, source_angle)
+                        if architecture == "continuous_spatial_codebook_v3":
+                            assert latent_codes is not None and code_lookup is not None
+                            keys = zip(targets[:, 0].tolist(), targets[:, 3].tolist(),
+                                       targets[:, 4].tolist())
+                            selected = []
+                            for key in keys:
+                                candidates = code_lookup[tuple(map(int, key))]
+                                if not candidates:
+                                    raise RuntimeError(f"no spatial SAR code for condition {key}")
+                                selected.append(random.choice(candidates))
+                            code_index = torch.tensor(selected, device=device)
+                            code = latent_codes[code_index].float()
+                            synthetic = generator(identity, condition, pyramid, code, apply_speckle=True)
+                        elif architecture == "continuous_spatial_style_v2":
+                            if args.style_source == "posterior":
+                                assert style_encoder is not None
+                                _, style, _ = style_encoder(
+                                    style_roi.to(device, non_blocking=True), sample=False)
+                            else:
+                                noise = torch.randn(len(rgb), int(state["style_dim"]), device=device)
+                                style = noise
+                            if args.style_source == "prior" and "style_prior_mean" in state and "style_prior_cholesky" in state:
+                                depression = targets[:, 3]
+                                prior_mean = state["style_prior_mean"].to(device)
+                                prior_factor = state["style_prior_cholesky"].to(device)
+                                if prior_mean.ndim == 3:
+                                    mean = prior_mean[targets[:, 0], depression]
+                                    factor = prior_factor[targets[:, 0], depression]
+                                else:
+                                    mean = prior_mean[depression]
+                                    factor = prior_factor[depression]
+                                style = mean + torch.bmm(factor, noise[:, :, None]).squeeze(2)
+                            synthetic = generator(identity, condition, pyramid, style, apply_speckle=True)
                         else:
-                            mean = prior_mean[depression]
-                            factor = prior_factor[depression]
-                        style = mean + torch.bmm(factor, noise[:, :, None]).squeeze(2)
-                    synthetic = generator(identity, condition, pyramid, style, apply_speckle=True)
-                elif not is_hifc:
-                    synthetic = generator(identity, condition, pyramid, apply_speckle=True)
-                if args.save_generated_dir is not None and saved_examples < args.save_generated_count:
-                    saved_examples += save_generated_examples(
-                        args.save_generated_dir, (synthetic + 1) * .5,
-                        targets, saved_examples, args.save_generated_count)
-                synthetic = augment((synthetic + 1) * .5)
+                            synthetic = generator(identity, condition, pyramid, apply_speckle=True)
+                    if args.save_generated_dir is not None and saved_examples < args.save_generated_count:
+                        saved_examples += save_generated_examples(
+                            args.save_generated_dir, (synthetic + 1) * .5,
+                            targets, saved_examples, args.save_generated_count)
+                    synthetic = augment((synthetic + 1) * .5)
             classifier_images, classifier_targets = synthetic, targets
             real_targets = None
-            if real_iterator is not None:
-                try:
-                    real_images, real_targets = next(real_iterator)
-                except StopIteration:
-                    real_iterator = iter(real_loader)
-                    real_images, real_targets = next(real_iterator)
+            if real_loader is not None:
+                real_images, real_targets = next(real_iterator)
                 real_images = real_images.to(device, non_blocking=True)
                 real_targets = real_targets.to(device, non_blocking=True)
-                classifier_images = torch.cat((synthetic, real_images), dim=0)
-                classifier_targets = torch.cat((targets, real_targets), dim=0)
+                classifier_images = real_images if classifier_images is None else torch.cat((synthetic, real_images), dim=0)
+                classifier_targets = real_targets if classifier_targets is None else torch.cat((targets, real_targets), dim=0)
+            if classifier_images is None or classifier_targets is None:
+                raise RuntimeError("classifier batch contains neither synthetic nor real samples")
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 logits, features = classifier(classifier_images, return_features=True)
@@ -526,14 +548,13 @@ def main() -> None:
             prediction = logits.argmax(1)
             loss_sum += loss.detach().item() * len(classifier_targets)
             correct += (prediction == classifier_targets[:, 0]).sum().item(); total += len(classifier_targets)
-            synthetic_count = len(synthetic)
-            synthetic_correct += (prediction[:synthetic_count] == targets[:, 0]).sum().item()
-            synthetic_total += synthetic_count
+            synthetic_count = len(synthetic) if synthetic is not None else 0
+            if synthetic_count:
+                synthetic_correct += (prediction[:synthetic_count] == targets[:, 0]).sum().item()
+                synthetic_total += synthetic_count
             if real_targets is not None:
                 real_correct += (prediction[synthetic_count:] == real_targets[:, 0]).sum().item()
                 real_total += len(real_targets)
-            if args.steps_per_epoch and batch_index + 1 >= args.steps_per_epoch:
-                break
         if real_test is None:
             metrics, by_depression = ({"loss": float("nan"), "top1": float("nan"),
                                        "top5": float("nan"), "samples": 0,
@@ -556,6 +577,10 @@ def main() -> None:
                      "frozen GAN samples plus real train pixels"
                      if real_train is not None else "frozen GAN samples only"),
                  "real_fraction": args.real_fraction,
+                 "real_batch_ratio": args.real_fraction,
+                 "synthetic_batch_size": synthetic_batch_size,
+                 "real_batch_size": real_batch_size,
+                 "steps_per_epoch": steps_per_epoch,
                  "real_train_root": str(args.real_train_root) if args.real_train_root is not None else None,
                  "train_band": args.train_band,
                  "train_polarization": args.train_polarization,
@@ -598,9 +623,10 @@ def main() -> None:
     config = {**{key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "gan_architecture": architecture,
         "synthetic_train_samples_per_epoch": len(generated_train),
-        "steps_per_epoch": (args.steps_per_epoch or len(train_loader)),
+        "steps_per_epoch": steps_per_epoch,
         "real_train_samples": len(real_train) if real_train is not None else 0,
         "real_fraction": args.real_fraction,
+        "real_batch_ratio": args.real_fraction,
         "synthetic_batch_size": synthetic_batch_size,
         "real_batch_size": real_batch_size,
         "real_test_samples": len(real_test) if real_test is not None else 0,

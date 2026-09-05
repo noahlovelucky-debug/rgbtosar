@@ -13,6 +13,7 @@ import csv
 import copy
 import hashlib
 import json
+import math
 import os
 import random
 from collections import defaultdict
@@ -60,6 +61,13 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--epoch-size", type=int, default=24000,
                         help="random weakly-unpaired samples per training epoch")
+    parser.add_argument("--condition-sampler", choices=("record", "class_uniform", "domain_uniform", "support_uniform"),
+                        default="record",
+                        help=("training-record sampler; record preserves the empirical data "
+                              "frequency, domain_uniform balances class and shared "
+                              "band/polarization/depression domains while retaining empirical 5-degree azimuth"))
+    parser.add_argument("--condition-sampler-seed", type=int, default=20260830,
+                        help="seed for deterministic class/acquisition sampling")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--validation-fraction", type=float, default=.15)
@@ -91,6 +99,21 @@ def arguments() -> argparse.Namespace:
         help=("native SAR teacher gradient route: full keeps the baseline; "
               "embedding_off detaches only SFM teacher embeddings; all_off "
               "also detaches geometry. Teacher metrics are always logged."))
+    parser.add_argument("--meta-transfer-weight", type=float, default=0.0,
+                        help=("HiFC-TU generated-support -> real-query meta loss "
+                              "weight; zero preserves the original baseline"))
+    parser.add_argument("--meta-transfer-every", type=int, default=4,
+                        help="compute the train-only meta objective every N batches")
+    parser.add_argument("--meta-transfer-inner-lr", type=float, default=.1,
+                        help="one virtual classifier-head SGD step size")
+    parser.add_argument("--meta-transfer-probe-checkpoint", type=Path,
+                        help="synthetic-only SARClassifier64 probe checkpoint")
+    parser.add_argument("--meta-transfer-query-batch-size", type=int, default=0,
+                        help="real X/HH meta-query batch size; zero uses the GAN batch size")
+    parser.add_argument("--meta-transfer-seed", type=int, default=1729,
+                        help="private RNG seed for meta support noise")
+    parser.add_argument("--meta-transfer-audit-events", type=int, default=0,
+                        help="record meta diagnostics for this many events (zero disables extra audit)")
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--local-rank", "--local_rank", type=int, default=-1,
@@ -162,25 +185,31 @@ def split_records(records: list[tuple], root: Path, manifest: Path,
     """Make a deterministic class/condition split without pairing RGB pixels."""
     if manifest.is_file():
         saved = json.loads(manifest.read_text(encoding="utf-8"))
-        if (saved.get("source_root") == str(root.resolve())
+        if (saved.get("split_version") == 2
+                and saved.get("source_root") == str(root.resolve())
                 and saved.get("filters") == filters):
             return set(saved["train"]), set(saved["validation"])
         # A manifest made by an earlier invocation may not contain the filter;
         # retaining it would silently mix all-condition and X/HH experiments.
-    groups: dict[tuple[str, str, str, int], list[tuple]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, int, int], list[tuple]] = defaultdict(list)
     for record in records:
         meta = record[4]
         groups[(record[2], str(meta["band"]), str(meta["pol"]),
-                int(meta["depression"]))].append(record)
+                int(meta["depression"]),
+                (int(meta["azimuth"]) + 15) // 30 % 12)].append(record)
     train, validation = [], []
     for group, values in sorted(groups.items()):
         ordered = sorted(values, key=lambda record: hashlib.sha256(
             f"{seed}:{group}:{record[0].relative_to(root)}".encode()).hexdigest())
-        count = max(1, round(len(ordered) * fraction)) if fraction else 0
+        # Keep at least one training record in every class/acquisition cell.
+        # This makes support_uniform a genuine observed-support sampler rather
+        # than silently dropping sparse angle cells into validation.
+        count = min(max(1, round(len(ordered) * fraction)), max(0, len(ordered) - 1)) if fraction else 0
         validation.extend(str(item[0].relative_to(root)) for item in ordered[:count])
         train.extend(str(item[0].relative_to(root)) for item in ordered[count:])
     payload = {
-        "version": HIFC_ARCHITECTURE, "source_root": str(root.resolve()),
+        "version": HIFC_ARCHITECTURE, "split_version": 2,
+        "source_root": str(root.resolve()),
         "seed": seed, "validation_fraction": fraction,
         "filters": filters,
         "train": sorted(train), "validation": sorted(validation)}
@@ -197,6 +226,7 @@ def configure_records(dataset: JointROIDataset, selected: set[str], root: Path,
         raise RuntimeError("empty HiFC train/validation split")
     dataset.epoch_size = epoch_size or len(dataset.records)
     dataset.random_epoch = bool(epoch_size)
+    dataset._rebuild_condition_index()
 
 
 class RealSARPrototypeDataset(Dataset):
@@ -222,6 +252,42 @@ class RealSARPrototypeDataset(Dataset):
         depression = (int(meta["depression"]) // 15) - 1
         code = (((class_id * 2 + band) * 4 + polarization) * 4 + depression)
         return roi, code
+
+
+class MetaRealXHHDataset(Dataset):
+    """Train-only real X/HH queries for the HiFC-TU meta objective.
+
+    The records come from the deterministic GAN validation split, never from
+    the official test root.  RGB is sampled by class only and is used to make
+    a synthetic support example; its associated SAR ROI is the outer query.
+    No RGB/SAR pixel correspondence is assumed.
+    """
+
+    def __init__(self, base: JointROIDataset, records: list[tuple]) -> None:
+        self.base = base
+        self.records = [record for record in records
+                         if str(record[4]["band"]).upper() == "X"
+                         and str(record[4]["pol"]).upper() == "HH"]
+        if not self.records:
+            raise RuntimeError("HiFC-TU requires real X/HH meta-query records")
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor,
+                                                 torch.Tensor, torch.Tensor]:
+        tif, _, class_name, _, meta, _ = self.records[index]
+        # The support RGB view is selected independently within the class.
+        # This retains the unpaired policy even though the record also carries
+        # a convenient nearest-view path.
+        rgb_angle = random.choice(self.base.class_rgb_angles[class_name])
+        rgb = self.base._rgb(self.base.rgb_paths[class_name, rgb_angle])
+        with Image.open(tif) as image:
+            query = image_tensor(image, 64, False).add(1.0).mul(.5)
+        class_id = torch.tensor(self.base.class_to_id[class_name], dtype=torch.long)
+        depression = torch.tensor(int(meta["depression"]), dtype=torch.long)
+        azimuth = torch.tensor(int(meta["azimuth"]), dtype=torch.long)
+        return rgb, query, class_id, torch.stack((depression, azimuth))
 
 
 def _prototype_split_digest(records: list[tuple], root: Path) -> str:
@@ -366,6 +432,93 @@ def load_teacher(checkpoint: Path, device: torch.device) -> SARClassifier64:
     return teacher
 
 
+def _private_rng_devices(device: torch.device) -> list[int]:
+    if device.type != "cuda":
+        return []
+    return [device.index if device.index is not None else torch.cuda.current_device()]
+
+
+def private_randn(shape: tuple[int, ...], device: torch.device, seed: int) -> torch.Tensor:
+    """Draw meta noise without perturbing the main training RNG stream."""
+    with torch.random.fork_rng(devices=_private_rng_devices(device)):
+        torch.manual_seed(int(seed))
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(int(seed))
+        return torch.randn(shape, device=device)
+
+
+def load_meta_probe(checkpoint: Path, device: torch.device) -> SARClassifier64:
+    """Load a frozen synthetic-only probe while preserving caller RNG state."""
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"meta-transfer probe not found: {checkpoint}")
+    with torch.random.fork_rng(devices=_private_rng_devices(device)):
+        torch.manual_seed(0)
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
+        if state.get("classes") != list(SOC40_CLASSES):
+            raise RuntimeError("meta-transfer probe class order mismatch")
+        metadata = state.get("meta_probe_metadata", {})
+        if metadata and metadata.get("real_images_seen", True):
+            raise RuntimeError("meta-transfer probe is not synthetic-only")
+        probe = SARClassifier64(len(SOC40_CLASSES)).to(device)
+        probe.load_state_dict(state["model"])
+    probe.eval()
+    set_grad(probe, False)
+    return probe
+
+
+def meta_transfer_head_loss(probe: SARClassifier64,
+                            support_images: torch.Tensor,
+                            support_labels: torch.Tensor,
+                            query_images: torch.Tensor,
+                            query_labels: torch.Tensor,
+                            inner_lr: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """One-step synthetic-support/real-query class-head meta objective.
+
+    The probe backbone is frozen.  A detached copy of its class head is
+    updated on generated support features, and the resulting real-query CE
+    supplies a second-order gradient only through the support images.
+    """
+    if support_images.ndim != 4 or query_images.ndim != 4:
+        raise ValueError("meta-transfer images must be [B,1,H,W]")
+    with torch.autocast(device_type=support_images.device.type, enabled=False):
+        support_images = support_images.float().clamp(0, 1)
+        query_images = query_images.float().clamp(0, 1)
+        _, support_features = probe(support_images, return_features=True)
+        with torch.no_grad():
+            _, query_features = probe(query_images, return_features=True)
+        weight = probe.classifier.weight.detach().clone().requires_grad_(True)
+        bias = probe.classifier.bias.detach().clone().requires_grad_(True)
+        support_logits = F.linear(support_features, weight, bias)
+        support_before = F.cross_entropy(
+            support_logits, support_labels, label_smoothing=.03)
+        grad_weight, grad_bias = torch.autograd.grad(
+            support_before, (weight, bias), create_graph=True)
+        updated_weight = weight - float(inner_lr) * grad_weight
+        updated_bias = bias - float(inner_lr) * grad_bias
+        support_after = F.cross_entropy(
+            F.linear(support_features, updated_weight, updated_bias), support_labels)
+        query_before = F.cross_entropy(
+            F.linear(query_features, weight.detach(), bias.detach()), query_labels)
+        query_after = F.cross_entropy(
+            F.linear(query_features, updated_weight, updated_bias), query_labels)
+    return query_after, {
+        "support_before": support_before.detach(),
+        "support_after": support_after.detach(),
+        "query_before": query_before.detach(),
+        "query_after": query_after.detach(),
+    }
+
+
+def _gradient_l2(grads: tuple[torch.Tensor | None, ...] | list[torch.Tensor | None],
+                 device: torch.device | None = None) -> torch.Tensor:
+    """Return a finite scalar norm for an allow-unused autograd result."""
+    pieces = [gradient.detach().float().square().sum()
+              for gradient in grads if gradient is not None]
+    if not pieces:
+        return torch.zeros((), device=device or torch.device("cpu"))
+    return torch.sqrt(torch.stack(pieces).sum().clamp_min(1e-24))
+
+
 def checkpoint_state(epoch: int, encoder: nn.Module, generator: nn.Module,
                      discriminator: nn.Module, ema_encoder: nn.Module,
                      ema_generator: nn.Module, generator_optimizer: torch.optim.Optimizer,
@@ -388,8 +541,16 @@ def checkpoint_state(epoch: int, encoder: nn.Module, generator: nn.Module,
         "training_policy": "class-matched unpaired RGB/SAR; no pixel alignment",
         "native_gradient_mode": args.native_gradient_mode,
         "sfm_mode": args.sfm_mode,
+        "meta_transfer_weight": args.meta_transfer_weight,
+        "meta_transfer_every": args.meta_transfer_every,
+        "meta_transfer_inner_lr": args.meta_transfer_inner_lr,
+        "meta_transfer_probe_checkpoint": (
+            str(args.meta_transfer_probe_checkpoint.resolve())
+            if args.meta_transfer_probe_checkpoint is not None else None),
         "sfm_prototype_cache": (str(sfm_prototype_cache)
                                  if sfm_prototype_cache is not None else None),
+        "condition_sampler": args.condition_sampler,
+        "condition_sampler_seed": args.condition_sampler_seed,
         "filters": {"band": args.band, "polarization": args.polarization,
                     "depression": args.depression},
     }
@@ -401,6 +562,16 @@ def main() -> None:
         raise ValueError("epochs, batch-size and epoch-size must be positive")
     if args.sfm_projection_count <= 0 or args.sfm_prototype_batch_size <= 0:
         raise ValueError("SFM projection and prototype batch sizes must be positive")
+    if args.meta_transfer_weight < 0.0:
+        raise ValueError("--meta-transfer-weight must be non-negative")
+    if args.meta_transfer_every <= 0 or args.meta_transfer_inner_lr <= 0.0:
+        raise ValueError("meta-transfer interval and inner learning rate must be positive")
+    if args.meta_transfer_query_batch_size < 0:
+        raise ValueError("--meta-transfer-query-batch-size must be non-negative")
+    if args.meta_transfer_audit_events < 0:
+        raise ValueError("--meta-transfer-audit-events must be non-negative")
+    if args.meta_transfer_weight > 0.0 and args.meta_transfer_probe_checkpoint is None:
+        raise ValueError("--meta-transfer-weight > 0 requires --meta-transfer-probe-checkpoint")
     distributed, world_size, rank, local_rank, device = setup_distributed(args)
     is_main = rank == 0
     if distributed:
@@ -423,7 +594,9 @@ def main() -> None:
     train_data = JointROIDataset(
         args.rgb_root, args.sar_train_root, rgb_size=128, roi_size=64,
         epoch_size=0, band=args.band, polarization=args.polarization,
-        depression=args.depression, augment_rgb=True, source_view_mode="random")
+        depression=args.depression, augment_rgb=True, source_view_mode="random",
+        condition_sampler=args.condition_sampler,
+        condition_sampler_seed=args.condition_sampler_seed)
     manifest = args.output / f"split_manifest__{args.band}_{args.polarization}_{args.depression}.json"
     filters = {"band": args.band, "polarization": args.polarization,
                "depression": args.depression}
@@ -458,6 +631,26 @@ def main() -> None:
     validation_loader = make_loader(
         validation_data, args.batch_size, args.workers, False, device,
         validation_sampler)
+
+    meta_query_data = None
+    meta_query_sampler = None
+    meta_query_loader = None
+    meta_probe = None
+    if args.meta_transfer_weight > 0.0:
+        # Validation records are already excluded from GAN/SFM training.  A
+        # fixed X/HH subset therefore gives the meta objective real pixels
+        # without shrinking the ordinary training set or touching the test.
+        meta_query_data = MetaRealXHHDataset(validation_data, validation_data.records)
+        meta_query_sampler = (DistributedSampler(
+            meta_query_data, num_replicas=world_size, rank=rank, shuffle=True,
+            seed=args.meta_transfer_seed, drop_last=True) if distributed else None)
+        meta_batch_size = args.meta_transfer_query_batch_size or args.batch_size
+        meta_query_loader = DataLoader(
+            meta_query_data, batch_size=meta_batch_size,
+            shuffle=meta_query_sampler is None, sampler=meta_query_sampler,
+            num_workers=args.workers, pin_memory=device.type == "cuda",
+            persistent_workers=args.workers > 0, drop_last=True)
+        meta_probe = load_meta_probe(args.meta_transfer_probe_checkpoint, device)
 
     teacher = load_teacher(args.native_classifier_checkpoint, device)
     sfm_prototype_cache = None
@@ -523,6 +716,11 @@ def main() -> None:
             raise RuntimeError(
                 f"--resume SFM mode mismatch: checkpoint={saved_sfm_mode}, "
                 f"requested={args.sfm_mode}")
+        saved_sampler = saved.get("condition_sampler", "record")
+        if saved_sampler != args.condition_sampler:
+            raise RuntimeError(
+                f"--resume condition sampler mismatch: checkpoint={saved_sampler}, "
+                f"requested={args.condition_sampler}")
         encoder.load_state_dict(saved["identity_encoder"])
         generator.load_state_dict(saved["generator"])
         discriminator.load_state_dict(saved["discriminator"])
@@ -583,15 +781,36 @@ def main() -> None:
                     if args.sfm_mode == "conditional_set_ot" else
                     "native pre-classifier embedding cosine/moments + D feature moments"),
             "geometry": "frozen native band/polarization/depression/azimuth heads",
+            "meta_transfer": ("one-step synthetic-support -> real X/HH query CE "
+                              "hypergradient; disabled when weight=0"),
         },
         "sfm_prototype_cache": (str(sfm_prototype_cache)
                                  if sfm_prototype_cache is not None else None),
         "sfm_prototype_signature": sfm_cache_signature,
+        "condition_sampler": args.condition_sampler,
+        "condition_sampler_seed": args.condition_sampler_seed,
+        "meta_transfer_query_records": (len(meta_query_data)
+                                          if meta_query_data is not None else 0),
         "gradient_routes": {
             "native_gradient_mode": args.native_gradient_mode,
             "teacher_metrics": "always evaluated; mode only changes E/G gradients",
+            "meta_transfer": {
+                "weight": args.meta_transfer_weight,
+                "every": args.meta_transfer_every,
+                "inner_lr": args.meta_transfer_inner_lr,
+                "probe": (str(args.meta_transfer_probe_checkpoint.resolve())
+                           if args.meta_transfer_probe_checkpoint is not None else None),
+                "query": "X/HH records from the deterministic validation split; test root never read",
+                "gradient_target": "generator only",
+            },
         },
         "unpaired_policy": "same vehicle class only; source RGB view is random and target SAR condition is metadata",
+        "condition_sampling_policy": {
+            "record": "empirical record frequency",
+            "class_uniform": "uniform class, empirical acquisition distribution within class",
+            "domain_uniform": "uniform class x shared (band, polarization, depression) domain; empirical 5-degree azimuth within class/domain",
+            "support_uniform": "legacy alias of domain_uniform",
+        }.get(args.condition_sampler, args.condition_sampler),
         "pixel_alignment_used": False,
         "comparison_to_v1": "new standalone HiFC-inspired path; V1 untouched",
     }
@@ -605,7 +824,7 @@ def main() -> None:
 
     columns = (
         "epoch", "generator", "adversarial", "rgb_identity", "ltc", "sfm",
-        "geometry", "discriminator", "disc_wrong_class", "disc_wrong_condition",
+        "geometry", "meta_transfer", "discriminator", "disc_wrong_class", "disc_wrong_condition",
         "r1", "rgb_accuracy", "native_class_accuracy", "native_band_accuracy",
         "native_polarization_accuracy", "native_depression_accuracy",
         "native_azimuth_accuracy", "validation_ltc", "validation_sfm",
@@ -618,6 +837,8 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        if meta_query_sampler is not None:
+            meta_query_sampler.set_epoch(epoch)
         encoder.train(); generator.train(); discriminator.train()
         set_grad(discriminator, True)
         totals = defaultdict(float)
@@ -625,6 +846,9 @@ def main() -> None:
         progress = tqdm(
             train_loader, desc=f"HiFC unpaired {epoch}/{args.epochs}",
             disable=not is_main)
+        train_data.set_epoch(epoch)
+        meta_iterator = iter(meta_query_loader) if meta_query_loader is not None else None
+        meta_events = 0
         for batch_index, batch in enumerate(progress):
             rgb = batch["rgb"].to(device, non_blocking=True)
             rgb_alt = batch["rgb_alt"].to(device, non_blocking=True)
@@ -686,6 +910,59 @@ def main() -> None:
                 fake_for_ltc = differentiable_augment(fake)
                 ltc = local_texture_contrast_loss(fake_for_ltc, real_d)
 
+            meta_transfer = real.new_zeros(())
+            meta_diagnostics = {
+                "support_before": real.new_zeros(()),
+                "support_after": real.new_zeros(()),
+                "query_before": real.new_zeros(()),
+                "query_after": real.new_zeros(()),
+            }
+            meta_audit = {}
+            run_meta = (meta_iterator is not None
+                        and batch_index % args.meta_transfer_every == 0)
+            if run_meta:
+                assert meta_query_loader is not None and meta_probe is not None
+                try:
+                    meta_batch = next(meta_iterator)
+                except StopIteration:
+                    meta_iterator = iter(meta_query_loader)
+                    meta_batch = next(meta_iterator)
+                meta_rgb, meta_query, meta_labels, meta_geometry = meta_batch
+                meta_rgb = meta_rgb.to(device, non_blocking=True)
+                meta_query = meta_query.to(device, non_blocking=True)
+                meta_labels = meta_labels.to(device, non_blocking=True)
+                meta_geometry = meta_geometry.to(device, non_blocking=True)
+                meta_azimuth = meta_geometry[:, 1]
+                meta_depression = meta_geometry[:, 0]
+                meta_condition_meta = torch.zeros(
+                    len(meta_rgb), 8, dtype=meta_rgb.dtype, device=device)
+                meta_condition_meta[:, :2] = torch.stack((
+                    torch.sin(meta_azimuth.float() * (math.pi / 180.0)),
+                    torch.cos(meta_azimuth.float() * (math.pi / 180.0))), dim=1)
+                meta_condition_meta[:, 3] = 1.0  # X band
+                meta_condition_meta[:, 4] = 1.0  # HH polarisation
+                meta_condition = condition_from_batch(
+                    meta_condition_meta, meta_depression)
+                with torch.no_grad():
+                    meta_identity, _, meta_pyramid = encoder(
+                        meta_rgb, return_pyramid=True)
+                meta_noise = private_randn(
+                    (len(meta_rgb), 1, 64, 64), device,
+                    args.meta_transfer_seed + epoch * 100003
+                    + batch_index * 97 + rank * 1009)
+                with torch.autocast(device_type=device.type, enabled=False):
+                    meta_identity = meta_identity.detach().float()
+                    meta_pyramid = tuple(value.detach().float()
+                                         for value in meta_pyramid)
+                    _, _, meta_fake, _ = generator(
+                        meta_identity, meta_condition.float(), meta_pyramid,
+                        meta_noise.float())
+                meta_transfer, meta_diagnostics = meta_transfer_head_loss(
+                    meta_probe, (meta_fake.float() + 1.0) * .5,
+                    meta_labels, meta_query, meta_labels,
+                    args.meta_transfer_inner_lr)
+                meta_events += 1
+
             # Keep the frozen native teacher in FP32.  Its parameters are never
             # trainable, while the selected route controls whether the fake
             # input receives a gradient through the teacher representation.
@@ -727,11 +1004,37 @@ def main() -> None:
                     teacher, fake.float(), meta.float(), depression, azimuth,
                     teacher_gradient=geometry_gradient)
                 adv_scale = 0.0 if epoch <= args.adversarial_warmup_epochs else 1.0
-                g_loss = (adv_scale * args.adversarial_weight * adversarial
-                          + args.rgb_identity_weight * rgb_loss
-                          + args.ltc_weight * ltc
-                          + args.sfm_weight * sfm
-                          + args.geometry_weight * geometry)
+                base_g_loss = (adv_scale * args.adversarial_weight * adversarial
+                               + args.rgb_identity_weight * rgb_loss
+                               + args.ltc_weight * ltc
+                               + args.sfm_weight * sfm
+                               + args.geometry_weight * geometry)
+                g_loss = base_g_loss + args.meta_transfer_weight * meta_transfer
+            if (run_meta and args.meta_transfer_audit_events
+                    and meta_events <= args.meta_transfer_audit_events):
+                generator_parameters = tuple(generator.parameters())
+                encoder_parameters = tuple(encoder.parameters())
+                base_gradients = torch.autograd.grad(
+                    base_g_loss, generator_parameters, retain_graph=True,
+                    allow_unused=True)
+                meta_gradients = torch.autograd.grad(
+                    meta_transfer, generator_parameters, retain_graph=True,
+                    allow_unused=True)
+                meta_encoder_gradients = torch.autograd.grad(
+                    meta_transfer, encoder_parameters, retain_graph=True,
+                    allow_unused=True)
+                base_norm = _gradient_l2(base_gradients, device)
+                raw_meta_norm = _gradient_l2(meta_gradients, device)
+                encoder_meta_norm = _gradient_l2(meta_encoder_gradients, device)
+                meta_audit = {
+                    "base_generator_grad_norm": float(base_norm),
+                    "raw_meta_generator_grad_norm": float(raw_meta_norm),
+                    "weighted_meta_to_base": float(
+                        args.meta_transfer_weight * raw_meta_norm
+                        / base_norm.clamp_min(1e-12)),
+                    "meta_encoder_grad_norm": float(encoder_meta_norm),
+                    "meta_requires_grad": bool(meta_transfer.requires_grad),
+                }
             generator_scaler.scale(g_loss).backward()
             generator_scaler.unscale_(generator_optimizer)
             torch.nn.utils.clip_grad_norm_(
@@ -760,7 +1063,8 @@ def main() -> None:
             values = {
                 "generator": g_loss, "adversarial": adversarial,
                 "rgb_identity": rgb_loss, "ltc": ltc, "sfm": sfm,
-                "geometry": geometry, "discriminator": d_loss,
+                "geometry": geometry, "meta_transfer": meta_transfer,
+                "discriminator": d_loss,
                 "disc_wrong_class": wrong_class,
                 "disc_wrong_condition": wrong_condition, "r1": r1,
                 "rgb_accuracy": rgb_accuracy,
@@ -770,6 +1074,19 @@ def main() -> None:
                 "native_depression_accuracy": aux_acc[2],
                 "native_azimuth_accuracy": aux_acc[3],
             }
+            if run_meta and is_main:
+                audit_path = args.output / "meta_transfer_audit.jsonl"
+                with audit_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "epoch": epoch,
+                        "batch": batch_index,
+                        "event": meta_events,
+                        "support_before": float(meta_diagnostics["support_before"]),
+                        "support_after": float(meta_diagnostics["support_after"]),
+                        "query_before": float(meta_diagnostics["query_before"]),
+                        "query_after": float(meta_diagnostics["query_after"]),
+                        **meta_audit,
+                    }) + "\n")
             for name, value in values.items():
                 totals[name] += float(value.detach())
             steps += 1
@@ -777,6 +1094,8 @@ def main() -> None:
                 g=f"{float(g_loss.detach()):.3f}",
                 d=f"{float(d_loss.detach()):.3f}",
                 ltc=f"{float(ltc.detach()):.3f}",
+                meta=(f"{float(meta_transfer.detach()):.3f}"
+                      if run_meta else "-"),
                 cls=f"{float(values['native_class_accuracy']):.3f}")
             if args.limit_train_batches and batch_index + 1 >= args.limit_train_batches:
                 break
@@ -836,7 +1155,7 @@ def main() -> None:
                     break
         metric_names = (
             "generator", "adversarial", "rgb_identity", "ltc", "sfm",
-            "geometry", "discriminator", "disc_wrong_class",
+            "geometry", "meta_transfer", "discriminator", "disc_wrong_class",
             "disc_wrong_condition", "r1", "rgb_accuracy",
             "native_class_accuracy", "native_band_accuracy",
             "native_polarization_accuracy", "native_depression_accuracy",
@@ -856,7 +1175,7 @@ def main() -> None:
         validation = {
             name: reduced_validation[index] / total_val_count
             for index, name in enumerate(validation_names)}
-        row = (epoch, *[averages.get(name, float("nan")) for name in columns[1:17]],
+        row = (epoch, *[averages.get(name, float("nan")) for name in columns[1:18]],
                validation.get("ltc", float("nan")),
                validation.get("sfm", float("nan")),
                validation.get("geometry", float("nan")),

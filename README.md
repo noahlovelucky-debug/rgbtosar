@@ -54,6 +54,29 @@ bash run_hifc_unpaired_all.sh
 代码入口：`hifc_unpaired_sar_gan.py`、`train_hifc_unpaired_sar_gan.py`、
 `render_hifc_unpaired_sar.py`；快速张量检查：`python test_hifc_unpaired_sar_gan.py`。
 
+### 2026-09-05 条件先验解耦采样
+
+本次论文候选只改变训练样本的采样分布，不改变 HiFC generator、判别器、loss、优化器
+或更新次数。`--condition-sampler record` 是原始 record-frequency 对照；
+`class_uniform` 按车型均匀；`domain_uniform` 按车型和共享的
+`(band, polarization, depression)` domain 均匀，再在该车型/domain 内保留真实 5° 方位
+的经验分布。它不合成缺失的 class-angle 组合，也不把 5° 网格宣称为新信息。
+
+正式 8 卡入口（从随机初始化开始，不从旧 checkpoint 续训）：
+
+```bash
+GPUS=0,1,2,3,4,5,6,7 \
+OUTPUT=runs/hifc_domain_uniform_full_20260905 \
+bash run_hifc_domain_uniform_8gpu.sh
+```
+
+同预算对照应使用同一命令，仅把 `--condition-sampler domain_uniform` 改为
+`record` 或 `class_uniform`，并固定 seed、epoch-size、global batch 和 validation manifest。
+严格的 `class×domain×30°` 共享方位 cell 在本数据 split 中只有 264/384，因此没有用于
+主训练；该覆盖率只作为诊断记录。分类器脚本的 `--real-fraction` 现在明确表示 batch
+组成比例而非 shot 数，并允许 `0` 和 `1`；显式 `--steps-per-epoch` 后各 real/synthetic
+比例可在相同 optimizer updates 下比较。
+
 ## 1. RGB_15 已暂停
 
 当前联合训练直接读取原始 `RGB`，约定 `1.png=0°、2.png=30°、...、12.png=330°`；

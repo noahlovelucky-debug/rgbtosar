@@ -46,6 +46,7 @@ class JointROIDataset(Dataset):
                  band: str = "all", polarization: str = "all", depression: str = "all",
                  augment_rgb: bool = True, preload_rgb: bool = True,
                  source_view_mode: str = "nearest",
+                 condition_sampler: str = "record", condition_sampler_seed: int = 0,
                  return_all_views: bool = False, return_rgb_mask: bool = False,
                  cache_dir: Path | None = None) -> None:
         self.rgb_root = Path(rgb_root)
@@ -59,7 +60,12 @@ class JointROIDataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir is not None else Path(tempfile.gettempdir()) / "rgb2sar_cache"
         if source_view_mode not in {"nearest", "random", "mixed"}:
             raise ValueError("source_view_mode must be nearest, random, or mixed")
+        if condition_sampler not in {"record", "class_uniform", "domain_uniform", "support_uniform"}:
+            raise ValueError("condition_sampler must be record, class_uniform, or domain_uniform")
         self.source_view_mode = source_view_mode
+        self.condition_sampler = condition_sampler
+        self.condition_sampler_seed = int(condition_sampler_seed)
+        self.condition_sampler_epoch = 0
         self.classes = list(SOC40_CLASSES)
         self.class_to_id = {name: index for index, name in enumerate(self.classes)}
         self.rgb_paths: dict[tuple[str, int], Path] = {}
@@ -89,6 +95,7 @@ class JointROIDataset(Dataset):
         self.records = records
         self.epoch_size = epoch_size or len(records)
         self.random_epoch = 0 < epoch_size < len(records)
+        self._rebuild_condition_index()
         self._rgb_cache: dict[Path, torch.Tensor] = {}
         self._rgb_mask_cache: dict[Path, torch.Tensor] = {}
         # Populate once in the parent process. DataLoader fork workers then
@@ -200,6 +207,66 @@ class JointROIDataset(Dataset):
     def __len__(self) -> int:
         return self.epoch_size
 
+    def set_epoch(self, epoch: int) -> None:
+        """Set the deterministic condition-sampling epoch for distributed runs."""
+        self.condition_sampler_epoch = int(epoch)
+
+    def _rebuild_condition_index(self) -> None:
+        """Index records for class/acquisition-independent sampling.
+
+        Acquisition support is balanced at the shared band/polarisation/
+        depression domain level.  The selected record retains its original
+        5-degree azimuth, sampled from the empirical class/domain distribution;
+        no missing class-angle combination is invented.  ``support_uniform``
+        remains an alias for older commands and has the same coarse semantics.
+        """
+        by_class: dict[str, dict[tuple[str, str, int, int], list[int]]] = {
+            name: {} for name in self.classes}
+        for index, record in enumerate(self.records):
+            class_name, meta = record[2], record[4]
+            key = (str(meta["band"]).upper(), str(meta["pol"]).upper(),
+                   int(meta["depression"]), (int(meta["azimuth"]) + 15) // 30 % 12)
+            by_class.setdefault(class_name, {}).setdefault(key, []).append(index)
+        self._records_by_class = {
+            name: sorted(indexes)
+            for name, groups in by_class.items()
+            for indexes in [sum(groups.values(), [])]
+            if indexes
+        }
+        self._class_names_with_records = sorted(self._records_by_class)
+        self._records_by_class_condition = by_class
+        domains: dict[str, dict[tuple[str, str, int], list[int]]] = {
+            name: {} for name in self.classes}
+        for index, record in enumerate(self.records):
+            class_name, meta = record[2], record[4]
+            domain = (str(meta["band"]).upper(), str(meta["pol"]).upper(),
+                      int(meta["depression"]))
+            domains.setdefault(class_name, {}).setdefault(domain, []).append(index)
+        self._records_by_class_domain = domains
+        domain_sets = [set(groups) for groups in domains.values() if groups]
+        self._shared_domain_keys = sorted(set.intersection(*domain_sets)) if domain_sets else []
+        if self.condition_sampler in {"domain_uniform", "support_uniform"}:
+            if not self._shared_domain_keys:
+                raise RuntimeError("domain_uniform requires a shared acquisition domain")
+            if any(len(domains[name]) < len(self._shared_domain_keys)
+                   for name in self._class_names_with_records):
+                raise RuntimeError("domain_uniform has incomplete class domain support")
+        self._shared_support_keys = self._shared_domain_keys
+
+    def _sample_record_index(self, index: int) -> int:
+        if self.condition_sampler == "record":
+            if self.random_epoch:
+                return random.randrange(len(self.records))
+            return index % len(self.records)
+        seed = (self.condition_sampler_seed + 1000003 * self.condition_sampler_epoch
+                + 9176 * int(index)) & 0xFFFFFFFF
+        rng = random.Random(seed)
+        class_name = rng.choice(self._class_names_with_records)
+        if self.condition_sampler in {"domain_uniform", "support_uniform"}:
+            key = rng.choice(self._shared_domain_keys)
+            return rng.choice(self._records_by_class_domain[class_name][key])
+        return rng.choice(self._records_by_class[class_name])
+
     def _decode_rgb_uint8(self, path: Path) -> tuple[Path, torch.Tensor]:
         with Image.open(path) as image:
             tensor = image_tensor(rgba_to_rgb(image), self.rgb_size, True)
@@ -300,9 +367,8 @@ class JointROIDataset(Dataset):
         return cached.float().div(255.0)
 
     def __getitem__(self, index: int) -> dict[str, object]:
-        if self.random_epoch:
-            index = random.randrange(len(self.records))
-        tif, nearest_rgb_path, class_name, bbox, meta, nearest_angle = self.records[index % len(self.records)]
+        record_index = self._sample_record_index(index)
+        tif, nearest_rgb_path, class_name, bbox, meta, nearest_angle = self.records[record_index]
         alternatives = self.class_rgb_angles[class_name]
         if self.source_view_mode == "random" or (self.source_view_mode == "mixed" and random.random() < .5):
             rgb_angle = random.choice(alternatives)
@@ -362,6 +428,8 @@ class JointROIDataset(Dataset):
             "rgb_views": len(self.rgb_paths),
             "rgb_naming": self.rgb_naming,
             "source_view_mode": self.source_view_mode,
+            "condition_sampler": self.condition_sampler,
+            "condition_sampler_seed": self.condition_sampler_seed,
             "return_all_views": self.return_all_views,
             "return_rgb_mask": self.return_rgb_mask,
             "pre_cropped": self.pre_cropped,
