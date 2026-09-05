@@ -721,6 +721,11 @@ def main() -> None:
             raise RuntimeError(
                 f"--resume condition sampler mismatch: checkpoint={saved_sampler}, "
                 f"requested={args.condition_sampler}")
+        saved_sampler_seed = int(saved.get("condition_sampler_seed", args.condition_sampler_seed))
+        if saved_sampler_seed != int(args.condition_sampler_seed):
+            raise RuntimeError(
+                f"--resume condition sampler seed mismatch: checkpoint={saved_sampler_seed}, "
+                f"requested={args.condition_sampler_seed}")
         encoder.load_state_dict(saved["identity_encoder"])
         generator.load_state_dict(saved["generator"])
         discriminator.load_state_dict(saved["discriminator"])
