@@ -4,8 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_ROOT="${DATA_ROOT:-${SCRIPT_DIR}/../A02}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-OUTPUT="${OUTPUT:-${SCRIPT_DIR}/runs/hifc_domain_uniform_full_20260905}"
+OUTPUT="${OUTPUT:-${SCRIPT_DIR}/runs/hifc_domain_uniform_full_fast_20260905}"
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
+VALIDATION_BATCHES="${VALIDATION_BATCHES:-64}"
 
 # Publication candidate: train from a fresh initialization.  The only model
 # variable relative to the record-frequency control is the condition sampler.
@@ -27,4 +28,5 @@ exec torchrun --standalone --nproc-per-node=8 \
   --identity-lr 0.0001 \
   --discriminator-lr 0.0001 \
   --condition-sampler domain_uniform \
-  --condition-sampler-seed 20260830
+  --condition-sampler-seed 20260830 \
+  --limit-validation-batches "${VALIDATION_BATCHES}"
